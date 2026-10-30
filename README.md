@@ -26,7 +26,7 @@ D-pad move · L/R pagina · Y+L/R salta 50 · START/SELECT ordena · A move cart
 ## Apoie o projeto
 Se quiser ajudar a manter o desenvolvimento:
 
-**[☕ Doar via PayPal](PAYPAL_LINK_AQUI)**
+**[☕ Doar via PayPal](https://www.paypal.com/donate/?business=ZUFZ9T4PD792W&no_recurring=0&currency_code=USD)**
 
 Doações são voluntárias e não dão direito a nada além da minha gratidão.
 
