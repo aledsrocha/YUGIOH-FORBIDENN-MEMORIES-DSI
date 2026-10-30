@@ -1,0 +1,18 @@
+# Conteudo protegido por direitos autorais: NUNCA commitar
+original_iso/
+*.iso
+*.bin
+*.cue
+*.MRG
+data/
+nitrofiles/
+assets/
+generated/
+*.nds
+*.elf
+*.img.bin
+build/
+build_tests/
+backup/
+*.patch
+__pycache__/
