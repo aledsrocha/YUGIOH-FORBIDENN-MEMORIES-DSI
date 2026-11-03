@@ -1,89 +1,97 @@
-# PS1_DSI — emulador de PlayStation para Nintendo DSi
+# YGOFM_DS — Yu-Gi-Oh! Forbidden Memories para Nintendo DS / DSi
 
-Emulador de PlayStation (PS1) que roda **direto no hardware do Nintendo DSi**,
-sem cartuchos com processador extra (como o SuperCard DSTWO).
+Port **não oficial** e fiel de *Yu-Gi-Oh! Forbidden Memories* (PS1) para Nintendo DS/DSi, escrito do zero em C++ (devkitARM + libnds).
+Testado no melonDS (modo DSi) e em um DSi XL real via nds-bootstrap.
 
-> **Status: experimental.** *Marvel vs. Capcom* chega à tela de título e *Yu-Gi-Oh!
-> Forbidden Memories* ao menu inicial, mas a uns 5–6% da velocidade real.
-> Ainda não dá para jogar.
+> Unofficial fan port. English summary at the bottom.
 
-<!-- coloque aqui um print: ![Marvel vs. Capcom no DSi](docs/mvc.png) -->
+## Objetivo: 100% fiel
 
-## O que já funciona
+- **Regras, dados e comportamento do duelo:** alvo de 100%. Tudo é conferido contra o jogo original (tabelas do disco, constantes e textos do executável) e protegido por testes. A ferramenta `tools/audit/audit_data.py` re-audita os dados.
+- **Imagem e som:** não dá para ser idêntico bit a bit. O DS tem tela de 256×192 (o PS1 usa 320×240), pouca RAM e nenhum decodificador dos vídeos do PS1. O alvo é **mesmo conteúdo e mesmo comportamento, com a apresentação adaptada** às duas telas do DS.
 
-| Parte | Estado |
+## Importante: sem conteúdo do jogo neste repositório
+
+Este repositório contém **apenas código e ferramentas**. Nenhuma ROM, ISO, arte, áudio ou dado do jogo é distribuído. Você precisa da **sua própria cópia legal** do jogo (imagem do disco do PS1) para gerar os dados.
+
+## Estado do projeto
+
+O desenvolvimento é entregue em "lotes"; cada um tem suas notas em `LOTE*_CHANGES.md`.
+
+| Área | Estado |
 |---|---|
-| CPU R3000A | ✅ recompilador MIPS → ARM (experimental, ~3x mais rápido) + interpretador |
-| GPU (desenho em software) | ✅ triângulos, sprites, transferências, frameskip |
-| CD-ROM (.cue/.bin, .iso) | ✅ boot de jogos, leitura de dados, XA ignorado |
-| GTE (geometria 3D) | ✅ portado do pcsx4all, validado contra o original |
-| Controle | ✅ controle digital |
-| Pular a intro da BIOS | ✅ |
-| Áudio (SPU) e vídeo (MDEC) | ⏳ etapa 6 |
-| Recompilador: ligação de blocos, GPU pelo 3D do DS | ⏳ etapa 7 (velocidade) |
-| Memory card no SD (slot 1) | ✅ `/psx/mcd001.mcr`, formato padrão (compatível com outros emuladores) |
+| Motor de duelo (fusões, equips, magias, rituais, armadilhas, Exodia, estrelas guardiãs, terrenos, cartas viradas) | Feito, com testes |
+| IA dos duelistas (scripts do original) | Feito |
+| Fluxo: recompensas, star chips, rank, baú, Build Deck, Password, Library, salvamento no cartão SD | Feito |
+| História e campanha jogável (eventos, diálogos, mapa, loja, game over, finais) | Feito |
+| Gráficos fora do duelo (título, menus, retratos, cenas) | Feito, com itens em aberto |
+| Desempenho (60 fps nos menus) | Em ajuste (lote 18) |
+| Áudio (lote 19) | Em andamento, ver abaixo |
+| Teste em hardware real, pacote final | Lote 20 |
 
-## Como usar
+### Áudio (lote 19)
 
-1. Compile com o [devkitPro](https://devkitpro.org) (devkitARM + libnds + libfat):
-   ```sh
-   make clean && make
+- Efeitos (`SD_SE.DAT`) e músicas (`SD_BGM.DAT`) são convertidos em PC por `tools/sound/extract_sound.py`. O formato dos efeitos e o driver de som do original foram decodificados; o sintetizador das músicas (`tools/sound/render2.py`) segue as regras do driver do jogo (tempo, volume, pan, pitch bend, reverb).
+- No DS, `source/AudioMixer.cpp` mixa a música (IMA-ADPCM, 22050 Hz estéreo) e até 8 efeitos; `source/Audio.cpp` envia o resultado a dois canais PCM16 do libnds, sem depender do maxmod.
+- **Limites conhecidos:** as músicas são sintetizadas (SEQ+VAB), não gravadas, e o reverb é aproximado, então o timbre pode diferir do PS1. Faixas longas (como os créditos) precisam da RAM do DSi. Os efeitos de fusão, magia/armadilha e mudança de fase no duelo ainda não estão ligados.
+
+### Itens em aberto
+
+- Tela "enigma se mexe" (falha visual), CPU atacando sem a cena de batalha, contagem gradual dos LP, página 2 do RESULTS, imagens originais das placas, arte da janela do memory card.
+- Vídeos do PS1 (`MOVIE.STR`) não têm decodificador no DS; os modelos 3D viram imagens 2D.
+
+## Como compilar
+
+Requisitos: [devkitPro](https://devkitpro.org/) com devkitARM e libnds; Python 3 (com `numpy` e `scipy` para as ferramentas de áudio); `gcc` para compilar `tools/sound/ima.c`.
+
+1. Extraia a sua imagem do jogo em `original_iso/` (`WA_MRG.MRG`, `SLUS_014.11`, `DATA/*`).
+2. Gere os dados com as ferramentas de `tools/` (`extract_*.py`; os comandos de cada uma estão nas notas dos lotes). Elas escrevem em `data/bin/` e `nitrofiles/data/`.
+3. Gere o áudio:
    ```
-2. Copie `PS1_DSI.nds` para o cartão SD.
-3. Copie **a sua** BIOS do PS1 (`scph1001.bin`, 512 KB) para `/psx/` ou para a raiz do SD.
-4. Coloque os jogos (`.cue` + `.bin`, ou `.iso`) em `/games` (ou `/psx/games`, `/psx`, `/`).
-5. Abra no DSi em **modo DSi** (16 MB / 133 MHz), por exemplo pelo Unlaunch.
+   gcc -O2 -shared -fPIC -o tools/sound/libima.so tools/sound/ima.c
+   python3 tools/sound/extract_sound.py original_iso/DATA nitrofiles/data/audio
+   ```
+   (`--wav DIR` grava prévias em WAV para ouvir no PC.)
+4. `make` gera `YGOFM_DS.nds`. Os arquivos de `nitrofiles/` vão dentro da ROM (NitroFS).
+5. Para rodar no DSi real, use nds-bootstrap; no melonDS, ative o modo DSi (a RAM de 16 MB faz diferença).
 
-Controles no seletor: **A** abre, **B** volta, **SELECT** liga/desliga pular a
-intro da BIOS, **L/R** frameskip, **X** alterna CPU recompilador/interpretador.
+## Testes (no PC)
 
-Controles no jogo (mesma posicao do controle do PS1):
-
-| DS | PS1 |
-|---|---|
-| Direcional | Direcional |
-| X / A / B / Y | △ / ○ / ✕ / □ |
-| L / R | L1 / R1 |
-| Toque na metade esquerda / direita da tela de baixo | L2 / R2 |
-| START / SELECT | START / SELECT |
-| START + SELECT | sai (grava o memory card antes) |
-
-O emulador grava `/psx_log.txt` no cartão (console do PS1, comandos de CD, erros).
-Os saves ficam em `/psx/mcd001.mcr` (gravados no SD cerca de 1 s depois de o jogo salvar).
-
-> Este projeto **não** inclui BIOS nem jogos. Use apenas cópias suas.
-
-## Testes no PC
-
-`pc_test/` roda o mesmo núcleo do emulador no PC e salva a tela em imagem:
-```sh
-cd pc_test && ./build.sh
-./psx_pc 60 "/caminho/jogo.cue" fast
 ```
+bash tests/run_tests.sh        # motor, campanha e história
+bash tests/check_ui_syntax.sh  # checagem de sintaxe das telas e do áudio
+```
+
+Os testes precisam dos `data/bin/*.dat` gerados no passo 2. `tests/audio/` tem um harness que renderiza o mixer no PC; `tests/preview/` gera prévias e medidas de desempenho das telas.
+
+## Estrutura
+
+| Pasta | Conteúdo |
+|---|---|
+| `source/`, `include/` | Motor de duelo, IA, campanha, história, perfil/salvamento, áudio |
+| `source/duel/` | Telas e modo de campo: duelo, Build Deck, Free Duel, Password, Library, mapa, menu principal |
+| `source/graphics/` | Renderização para as duas telas do DS |
+| `tools/` | Extratores de dados do disco, auditoria, conversão de gráficos |
+| `tools/sound/` | Conversão de efeitos e músicas |
+| `tests/` | Testes de regras, prévias de telas e harness de áudio |
+| `LOTE*_CHANGES.md`, `ROTEIRO.md`, `AUDITORIA.md` | Histórico, plano e auditorias |
+
+## Controles (Build Deck)
+
+D-pad move · L/R pagina · Y+L/R salta 50 · START/SELECT ordena · A move carta · B sai · X info · ←/→ troca de painel.
 
 ## Apoie o projeto
 
-O PS1_DSI é livre e gratuito, e vai continuar assim. Se você gosta do projeto
-e quer ajudar no desenvolvimento (tempo de trabalho e hardware de teste),
-considere uma doação:
+Se quiser ajudar a manter o desenvolvimento:
 
-[![Doar com PayPal](https://img.shields.io/badge/PayPal-Doar-00457C?logo=paypal&logoColor=white)](https://www.paypal.com/donate/?business=ZUFZ9T4PD792W&no_recurring=0&currency_code=USD)
+**[☕ Doar via PayPal](https://www.paypal.com/donate/?business=ZUFZ9T4PD792W&no_recurring=0&currency_code=USD)**
 
-Obrigado a todos que apoiam!
+Doações são voluntárias e não dão direito a nada além da minha gratidão.
 
-## Créditos e licença
+## Aviso legal
 
-- Núcleo (CPU, GPU, CD, DMA, timers, front-end do DS): escrito para este projeto,
-  com base na documentação [psx-spx](https://psx-spx.consoledev.net/) (Martin Korth / nocash).
-- GTE: portado do [pcsx4all](https://github.com/dmitrysmagin/pcsx4all)
-  (PCSX / PCSX-Revolution / PCSX-ReARMed), GPL v2+.
-- Desenvolvido por Alessandro Rocha com assistência de IA.
+Yu-Gi-Oh! e Forbidden Memories são marcas e propriedade de Konami / Kazuki Takahashi / Shueisha. Projeto sem fins comerciais, sem afiliação ou endosso da Konami. Código sob licença MIT; o conteúdo do jogo continua sendo propriedade de seus donos.
 
-Licença: **GNU GPL v3 ou posterior** — veja [COPYING](COPYING) e [CREDITOS.txt](CREDITOS.txt).
+## English
 
----
-
-**English:** experimental PlayStation emulator for the Nintendo DSi (native ARM9,
-no add-on hardware). Boots commercial games (e.g. *Marvel vs. Capcom*) at ~6%
-speed; a MIPS→ARM dynarec is next. GPL v3+. No BIOS or games included.
-Donations: [PayPal](https://www.paypal.com/donate/?business=ZUFZ9T4PD792W&no_recurring=0&currency_code=USD).
+Unofficial fan port of Yu-Gi-Oh! Forbidden Memories (PS1) to Nintendo DS/DSi, aiming at the original's rules, data and behaviour with the presentation adapted to the DS's two screens. Code and tools only: you must supply your own legally obtained game image and generate the data with the scripts in `tools/`. Build with devkitARM/libnds (`make`); run the PC tests with `bash tests/run_tests.sh`. Audio is converted from the game's own sound data (`tools/sound/`) and played through libnds sound channels. Donations: PayPal link above.
