@@ -1,37 +1,89 @@
-# YGOFM_DS — Yu-Gi-Oh! Forbidden Memories para Nintendo DS / DSi
+# PS1_DSI — emulador de PlayStation para Nintendo DSi
 
-Port **não oficial** e fiel de *Yu-Gi-Oh! Forbidden Memories* (PS1) para Nintendo DS/DSi, escrito do zero em C++ (devkitARM + libnds).
-Testado em melonDS (modo DSi) e em um DSi XL real via nds-bootstrap.
+Emulador de PlayStation (PS1) que roda **direto no hardware do Nintendo DSi**,
+sem cartuchos com processador extra (como o SuperCard DSTWO).
 
-> Unofficial fan port. English summary at the bottom.
+> **Status: experimental.** *Marvel vs. Capcom* chega à tela de título e *Yu-Gi-Oh!
+> Forbidden Memories* ao menu inicial, mas a uns 5–6% da velocidade real.
+> Ainda não dá para jogar.
 
-## Status
-Em desenvolvimento, entregue em "lotes". Já funcionam: campanha completa, duelos, fusões, equipamentos, loja, Build Deck fiel ao PS1 e cenas da história. Em andamento: Free Duel, Password, tela de nome, mapa 3D, memory card, Library, OPTION, 2P/Trade, áudio.
-O histórico de cada lote está em [`docs/`](docs/).
+<!-- coloque aqui um print: ![Marvel vs. Capcom no DSi](docs/mvc.png) -->
 
-## Importante: sem conteúdo do jogo neste repositório
-Este repositório contém **apenas código e ferramentas**. Nenhuma ROM, ISO, arte, áudio ou dado do jogo é distribuído (veja `.gitignore`).
-Você precisa da **sua própria cópia legal** do jogo (imagem do disco do PS1) para gerar os dados.
+## O que já funciona
 
-## Como compilar
-Requisitos: [devkitPro](https://devkitpro.org/) com devkitARM, libnds e calico; Python 3.
-1. Coloque sua imagem do jogo extraída em `original_iso/` (arquivos `WA_MRG.MRG`, `SLUS_014.11`, `DATA/*`).
-2. Rode as ferramentas de `tools/` para gerar `data/bin/` e `nitrofiles/data/` (ex.: `python3 tools/extract_deckui.py original_iso data/bin`; veja os `LOTE*_CHANGES.md` para as demais).
-3. `make` gera `YGOFM_DS.nds`.
-4. Testes unitários no PC: `bash tests/run_tests.sh`.
+| Parte | Estado |
+|---|---|
+| CPU R3000A | ✅ recompilador MIPS → ARM (experimental, ~3x mais rápido) + interpretador |
+| GPU (desenho em software) | ✅ triângulos, sprites, transferências, frameskip |
+| CD-ROM (.cue/.bin, .iso) | ✅ boot de jogos, leitura de dados, XA ignorado |
+| GTE (geometria 3D) | ✅ portado do pcsx4all, validado contra o original |
+| Controle | ✅ controle digital |
+| Pular a intro da BIOS | ✅ |
+| Áudio (SPU) e vídeo (MDEC) | ⏳ etapa 6 |
+| Recompilador: ligação de blocos, GPU pelo 3D do DS | ⏳ etapa 7 (velocidade) |
+| Memory card no SD (slot 1) | ✅ `/psx/mcd001.mcr`, formato padrão (compatível com outros emuladores) |
 
-## Controles (Build Deck)
-D-pad move · L/R pagina · Y+L/R salta 50 · START/SELECT ordena · A move carta · B sai · X info · ←/→ troca de painel.
+## Como usar
+
+1. Compile com o [devkitPro](https://devkitpro.org) (devkitARM + libnds + libfat):
+   ```sh
+   make clean && make
+   ```
+2. Copie `PS1_DSI.nds` para o cartão SD.
+3. Copie **a sua** BIOS do PS1 (`scph1001.bin`, 512 KB) para `/psx/` ou para a raiz do SD.
+4. Coloque os jogos (`.cue` + `.bin`, ou `.iso`) em `/games` (ou `/psx/games`, `/psx`, `/`).
+5. Abra no DSi em **modo DSi** (16 MB / 133 MHz), por exemplo pelo Unlaunch.
+
+Controles no seletor: **A** abre, **B** volta, **SELECT** liga/desliga pular a
+intro da BIOS, **L/R** frameskip, **X** alterna CPU recompilador/interpretador.
+
+Controles no jogo (mesma posicao do controle do PS1):
+
+| DS | PS1 |
+|---|---|
+| Direcional | Direcional |
+| X / A / B / Y | △ / ○ / ✕ / □ |
+| L / R | L1 / R1 |
+| Toque na metade esquerda / direita da tela de baixo | L2 / R2 |
+| START / SELECT | START / SELECT |
+| START + SELECT | sai (grava o memory card antes) |
+
+O emulador grava `/psx_log.txt` no cartão (console do PS1, comandos de CD, erros).
+Os saves ficam em `/psx/mcd001.mcr` (gravados no SD cerca de 1 s depois de o jogo salvar).
+
+> Este projeto **não** inclui BIOS nem jogos. Use apenas cópias suas.
+
+## Testes no PC
+
+`pc_test/` roda o mesmo núcleo do emulador no PC e salva a tela em imagem:
+```sh
+cd pc_test && ./build.sh
+./psx_pc 60 "/caminho/jogo.cue" fast
+```
 
 ## Apoie o projeto
-Se quiser ajudar a manter o desenvolvimento:
 
-**[☕ Doar via PayPal](https://www.paypal.com/donate/?business=ZUFZ9T4PD792W&no_recurring=0&currency_code=USD)**
+O PS1_DSI é livre e gratuito, e vai continuar assim. Se você gosta do projeto
+e quer ajudar no desenvolvimento (tempo de trabalho e hardware de teste),
+considere uma doação:
 
-Doações são voluntárias e não dão direito a nada além da minha gratidão.
+[![Doar com PayPal](https://img.shields.io/badge/PayPal-Doar-00457C?logo=paypal&logoColor=white)](https://www.paypal.com/donate/?business=ZUFZ9T4PD792W&no_recurring=0&currency_code=USD)
 
-## Aviso legal
-Yu-Gi-Oh! e Forbidden Memories são marcas e propriedade de Konami / Kazuki Takahashi / Shueisha. Projeto sem fins comerciais, sem afiliação ou endosso da Konami. Código sob licença MIT; o conteúdo do jogo continua sendo propriedade de seus donos.
+Obrigado a todos que apoiam!
 
-## English
-Unofficial fan port of Yu-Gi-Oh! Forbidden Memories (PS1) to Nintendo DS/DSi. Code and tools only — you must supply your own legally obtained game image. Build with devkitARM/libnds; see above. Donations: PayPal link above.
+## Créditos e licença
+
+- Núcleo (CPU, GPU, CD, DMA, timers, front-end do DS): escrito para este projeto,
+  com base na documentação [psx-spx](https://psx-spx.consoledev.net/) (Martin Korth / nocash).
+- GTE: portado do [pcsx4all](https://github.com/dmitrysmagin/pcsx4all)
+  (PCSX / PCSX-Revolution / PCSX-ReARMed), GPL v2+.
+- Desenvolvido por Alessandro Rocha com assistência de IA.
+
+Licença: **GNU GPL v3 ou posterior** — veja [COPYING](COPYING) e [CREDITOS.txt](CREDITOS.txt).
+
+---
+
+**English:** experimental PlayStation emulator for the Nintendo DSi (native ARM9,
+no add-on hardware). Boots commercial games (e.g. *Marvel vs. Capcom*) at ~6%
+speed; a MIPS→ARM dynarec is next. GPL v3+. No BIOS or games included.
+Donations: [PayPal](https://www.paypal.com/donate/?business=ZUFZ9T4PD792W&no_recurring=0&currency_code=USD).

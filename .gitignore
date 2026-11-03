@@ -1,18 +1,24 @@
-# Conteudo protegido por direitos autorais: NUNCA commitar
-original_iso/
-*.iso
-*.bin
-*.cue
-*.MRG
-data/
-nitrofiles/
-assets/
-generated/
+# saida da compilacao
+build/
 *.nds
 *.elf
-*.img.bin
-build/
-build_tests/
-backup/
-*.patch
-__pycache__/
+*.o
+*.d
+*.map
+
+# NUNCA versionar: BIOS e jogos sao protegidos por direitos autorais
+*.bin
+*.BIN
+*.cue
+*.iso
+*.img
+*.mcr
+data/
+
+# harness de PC
+pc_test/psx_pc
+pc_test/*.ppm
+pc_test/*.png
+
+# backups
+*.backup*
