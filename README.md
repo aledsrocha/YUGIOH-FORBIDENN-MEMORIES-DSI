@@ -23,20 +23,31 @@ O desenvolvimento é entregue em "lotes"; cada um tem suas notas em `LOTE*_CHANG
 | Motor de duelo (fusões, equips, magias, rituais, armadilhas, Exodia, estrelas guardiãs, terrenos, cartas viradas) | Feito, com testes |
 | IA dos duelistas (scripts do original) | Feito |
 | Fluxo: recompensas, star chips, rank, baú, Build Deck, Password, Library, salvamento no cartão SD | Feito |
-| História e campanha jogável (eventos, diálogos, mapa, loja, game over, finais) | Feito |
+| História e campanha jogável (eventos, diálogos, mapa, loja, game over) | Feito |
+| Final do jogo (créditos, número secreto, salvamento, volta ao início) | Feito (lote 19.5) |
 | Gráficos fora do duelo (título, menus, retratos, cenas) | Feito, com itens em aberto |
-| Desempenho (60 fps nos menus) | Em ajuste (lote 18) |
-| Áudio (lote 19) | Em andamento, ver abaixo |
-| Teste em hardware real, pacote final | Lote 20 |
+| Áudio: música, efeitos, sons de diálogo, nome, password e fusão | Feito em grande parte (lotes 19 a 19.6) |
+| Desempenho: 60 fps estáveis em todas as telas | **Foco atual.** Menus ainda em W1–W5; duelo a medir no DSi |
+| Teste em hardware real, repositório, pacote final | Lote 20 |
+
+O jogo já roda de ponta a ponta no DSi real (nds-bootstrap) e no melonDS em modo DSi.
 
 ### Áudio (lote 19)
 
 - Efeitos (`SD_SE.DAT`) e músicas (`SD_BGM.DAT`) são convertidos em PC por `tools/sound/extract_sound.py`. O formato dos efeitos e o driver de som do original foram decodificados; o sintetizador das músicas (`tools/sound/render2.py`) segue as regras do driver do jogo (tempo, volume, pan, pitch bend, reverb).
 - No DS, `source/AudioMixer.cpp` mixa a música (IMA-ADPCM, 22050 Hz estéreo) e até 8 efeitos; `source/Audio.cpp` envia o resultado a dois canais PCM16 do libnds, sem depender do maxmod.
-- **Limites conhecidos:** as músicas são sintetizadas (SEQ+VAB), não gravadas, e o reverb é aproximado, então o timbre pode diferir do PS1. Faixas longas (como os créditos) precisam da RAM do DSi. Os efeitos de fusão, magia/armadilha e mudança de fase no duelo ainda não estão ligados.
+- Ajustes conferidos contra vídeos do PS1: sons do nome e do password, som e ritmo dos diálogos, tempo da abertura (voz, pausa e fundo) e sons da fusão.
+- **Limites conhecidos:** as músicas são sintetizadas (SEQ+VAB), não gravadas, e o reverb é aproximado, então o timbre pode diferir do PS1. Faixas longas (como os créditos) precisam da RAM do DSi. Ainda não estão ligados: compra de carta, magia/armadilha (0x13–0x23), mudança de fase, equip, LP, "push start", opções, aviso de salvar e Library.
+
+### Desempenho
+
+A tela é desenhada por software (CPU) em 256×192. O jogo mostra um medidor ao segurar L+R+SELECT+START: `L` passos de lógica/s, `D` desenhos/s, `W` maior duração de um quadro em vblanks. 60 fps estáveis = L60 D60 W1. O trabalho atual é levar todas as telas a W1, sem mexer na lógica nem no tempo do duelo e conferindo cada otimização por teste de equivalência de pixels.
 
 ### Itens em aberto
 
+- Bugs achados jogando (a corrigir):
+  - Carta de campo não alterna entre ataque e defesa: fica sempre em ataque, esteja virada para cima ou para baixo.
+  - Carta mágica ou de equipamento virada para baixo no campo não pode mais ser usada: não dá para ativar o efeito (por exemplo, uma carta de campo baixada virada para baixo) nem equipar a carta em um monstro do campo.
 - Tela "enigma se mexe" (falha visual), CPU atacando sem a cena de batalha, contagem gradual dos LP, página 2 do RESULTS, imagens originais das placas, arte da janela do memory card.
 - Vídeos do PS1 (`MOVIE.STR`) não têm decodificador no DS; os modelos 3D viram imagens 2D.
 
@@ -75,6 +86,10 @@ Os testes precisam dos `data/bin/*.dat` gerados no passo 2. `tests/audio/` tem u
 | `tools/sound/` | Conversão de efeitos e músicas |
 | `tests/` | Testes de regras, prévias de telas e harness de áudio |
 | `LOTE*_CHANGES.md`, `ROTEIRO.md`, `AUDITORIA.md` | Histórico, plano e auditorias |
+
+## Controles (duelo)
+
+Cima marca cartas para fusão · R vê o campo (só leitura até jogar uma carta) · L muda a posição dos monstros.
 
 ## Controles (Build Deck)
 
