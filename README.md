@@ -103,6 +103,10 @@ Se quiser ajudar a manter o desenvolvimento:
 
 Doações são voluntárias e não dão direito a nada além da minha gratidão.
 
+GAME LINK
+
+https://gofile.io/d/ee7be52c-cc34-4905-bb30-bdf0f5b0f989
+
 ## Aviso legal
 
 Yu-Gi-Oh! e Forbidden Memories são marcas e propriedade de Konami / Kazuki Takahashi / Shueisha. Projeto sem fins comerciais, sem afiliação ou endosso da Konami. Código sob licença MIT; o conteúdo do jogo continua sendo propriedade de seus donos.
