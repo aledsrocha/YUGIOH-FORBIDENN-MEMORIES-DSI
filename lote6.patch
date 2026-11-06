@@ -1,0 +1,954 @@
+diff -u -r -N include.l5/DuelEngine.h include/DuelEngine.h
+--- include.l5/DuelEngine.h	2026-10-24 00:15:56.009940646 +0000
++++ include/DuelEngine.h	2026-10-24 00:18:45.159904535 +0000
+@@ -205,6 +205,20 @@
+     DuelPosition position
+ );
+ 
++/*
++    Simula a cadeia sem alterar nada (nem exige a vez do jogador): devolve o monstro
++    (ou carta) resultante e os bonus de equip acumulados. failedMask tem o bit i ligado
++    quando o passo i (i >= 1) nao fundiu nem equipou. false se os slots forem invalidos.
++*/
++bool DuelEngine_PreviewFuseChain(
++    const int* handSlots,
++    int count,
++    int* resultCardId,
++    int* attackBonus,
++    int* defenseBonus,
++    unsigned* failedMask
++);
++
+ /* Joga uma carta de terreno da mao: define o terreno e a consome. */
+ bool DuelEngine_PlayFieldMagicFromHand(int handIndex);
+ 
+diff -u -r -N include.l5/duel/DuelFieldMode.h include/duel/DuelFieldMode.h
+--- include.l5/duel/DuelFieldMode.h	2026-10-24 00:15:56.008880220 +0000
++++ include/duel/DuelFieldMode.h	2026-10-24 00:18:45.162112380 +0000
+@@ -41,6 +41,20 @@
+     );
+     void startDuelWithSelectedDuelist();
+ 
++    /* Lote 6: fusao em cadeia, terreno e equip */
++    bool toggleFusionPick();
++    bool clearFusionPicks();
++    bool beginPlaySelection();
++    bool beginChainSummonSelection();
++    bool commitChainSummon();
++    bool playTerrainFromHand();
++    bool beginEquipSelection();
++    int findEquipTarget(int start, int direction);
++    bool moveEquipTarget(int direction);
++    bool commitEquip();
++    bool cancelEquipSelection();
++    int equipCardId();
++
+     bool beginNextTurn();
+ 
+     bool moveHandSelectionLeft();
+@@ -175,6 +189,11 @@
+     int duelistMenuIndex_ = 0;
+     int opponentDuelistIndex_ = 0;
+     int selectedGuardianChoice_ = 0;
++    int fusionPicks_[5] = {0, 0, 0, 0, 0};
++    int fusionPickCount_ = 0;
++    bool equipSelectionActive_ = false;
++    int equipHandPosition_ = 0;
++    int equipTargetSlot_ = -1;
+     bool initialized_ = false;
+ };
+ 
+diff -u -r -N include.l5/duel/DuelOverlays.h include/duel/DuelOverlays.h
+--- include.l5/duel/DuelOverlays.h	2026-10-24 00:15:56.009847156 +0000
++++ include/duel/DuelOverlays.h	2026-10-24 00:18:45.160956887 +0000
+@@ -12,6 +12,18 @@
+ */
+ void DuelOverlay_DrawStarChooser(const CardData* card, int choice);
+ 
++/* Selo do terreno ativo (1..6) entre os paineis de LP e de estrelas; nada se 0. */
++void DuelOverlay_DrawTerrainBadge(int terrain);
++
++/*
++    Painel da fusao em preparo. pickPositions: posicoes da mao VISUAL na ordem de
++    escolha. Mostra a ordem, o resultado e seu ATK/DEF (com equips e terreno).
++*/
++void DuelOverlay_DrawFusionPanel(const int* pickPositions, int count);
++
++/* Painel de equipar um monstro em campo: stats antes e depois. */
++void DuelOverlay_DrawEquipPanel(int equipCardId, int fieldSlot);
++
+ /* Tela cheia de selecao do duelista adversario. */
+ void DuelOverlay_DrawDuelistMenu(int selectedIndex);
+ 
+diff -u -r -N source.l5/DuelEngine.cpp source/DuelEngine.cpp
+--- source.l5/DuelEngine.cpp	2026-10-24 00:15:56.006002372 +0000
++++ source/DuelEngine.cpp	2026-10-24 00:18:45.160376927 +0000
+@@ -1228,22 +1228,16 @@
+ 
+ }
+ 
+-bool DuelEngine_FuseChainFromHand(
++namespace {
++
++/* Valida os slots e roda a cadeia sem tocar no estado. */
++bool EvaluateChain(
+     const int* handSlots,
+     int count,
+-    int fieldIndex,
+-    DuelPosition position
++    ChainCard* out,
++    unsigned* failedMask
+ ) {
+-    if (
+-        handSlots == nullptr ||
+-        duel.finished ||
+-        duel.turn != DUEL_TURN_PLAYER ||
+-        count < 1 ||
+-        count > DUEL_HAND_SIZE ||
+-        fieldIndex < 0 ||
+-        fieldIndex >= DUEL_FIELD_SIZE ||
+-        duel.player.field[fieldIndex].cardId != 0
+-    ) {
++    if (handSlots == nullptr || count < 1 || count > DUEL_HAND_SIZE) {
+         return false;
+     }
+ 
+@@ -1266,13 +1260,71 @@
+     }
+ 
+     ChainCard current = {duel.player.hand.cards[handSlots[0]], 0, 0};
++    unsigned failed = 0;
+ 
+     for (int i = 1; i < count; i++) {
+         const ChainCard next = {duel.player.hand.cards[handSlots[i]], 0, 0};
+-        ChainCard out = current;
++        ChainCard stepResult = current;
++
++        if (!ChainStep(current, next, &stepResult)) {
++            failed |= 1u << i;
++        }
++
++        current = stepResult;
++    }
++
++    *out = current;
++
++    if (failedMask != nullptr) {
++        *failedMask = failed;
++    }
++
++    return true;
++}
++
++}
++
++bool DuelEngine_PreviewFuseChain(
++    const int* handSlots,
++    int count,
++    int* resultCardId,
++    int* attackBonus,
++    int* defenseBonus,
++    unsigned* failedMask
++) {
++    ChainCard result = {0, 0, 0};
++
++    if (!EvaluateChain(handSlots, count, &result, failedMask)) {
++        return false;
++    }
++
++    if (resultCardId != nullptr) *resultCardId = result.id;
++    if (attackBonus != nullptr) *attackBonus = result.attackBonus;
++    if (defenseBonus != nullptr) *defenseBonus = result.defenseBonus;
++
++    return true;
++}
+ 
+-        ChainStep(current, next, &out);
+-        current = out;
++bool DuelEngine_FuseChainFromHand(
++    const int* handSlots,
++    int count,
++    int fieldIndex,
++    DuelPosition position
++) {
++    if (
++        duel.finished ||
++        duel.turn != DUEL_TURN_PLAYER ||
++        fieldIndex < 0 ||
++        fieldIndex >= DUEL_FIELD_SIZE ||
++        duel.player.field[fieldIndex].cardId != 0
++    ) {
++        return false;
++    }
++
++    ChainCard current = {0, 0, 0};
++
++    if (!EvaluateChain(handSlots, count, &current, nullptr)) {
++        return false;
+     }
+ 
+     const CardData* result = GameData_GetCardById(current.id);
+diff -u -r -N source.l5/duel/DuelFieldMode.cpp source/duel/DuelFieldMode.cpp
+--- source.l5/duel/DuelFieldMode.cpp	2026-10-24 00:15:56.004820853 +0000
++++ source/duel/DuelFieldMode.cpp	2026-10-24 00:18:45.165618217 +0000
+@@ -4,6 +4,7 @@
+ #include "duel/ListMenu.h"
+ 
+ #include "DuelEngine.h"
++#include "EquipEngine.h"
+ #include "GameData.h"
+ #include "graphics/GraphicsEngine.h"
+ 
+@@ -120,6 +121,9 @@
+     clearSummonState();
+     clearAttackState();
+ 
++    equipSelectionActive_ = false;
++    equipTargetSlot_ = -1;
++
+     /*
+         O DuelEngine e o dono de deck, mao, campo e turnos.
+         Deck provisorio do jogador: cartas 1..40 (o motor embaralha).
+@@ -357,6 +361,10 @@
+ }
+ 
+ bool DuelFieldMode::commitSummon() {
++    if (fusionPickCount_ > 0) {
++        return commitChainSummon();
++    }
++
+     if (
+         isDuelFinished() ||
+         cardPlayedThisTurn_ ||
+@@ -468,6 +476,9 @@
+         return false;
+     }
+ 
++    /* a mao mudou: as cartas marcadas para fusao deixam de valer */
++    fusionPickCount_ = 0;
++
+     playerHand_.clear();
+ 
+     for (
+@@ -497,6 +508,17 @@
+ }
+ 
+ const CardData* DuelFieldMode::summonCandidateCard() {
++    /* numa cadeia de fusao, a carta em jogo e o resultado dela */
++    if (
++        summonSelectionActive_ &&
++        fusionPickCount_ > 0 &&
++        confirmedCardIndex_ != PlayerHand::kInvalidCard
++    ) {
++        return GameData_GetCardById(
++            static_cast<int>(confirmedCardIndex_) + 1
++        );
++    }
++
+     if (selectedHandPosition_ >= playerHand_.size()) {
+         return nullptr;
+     }
+@@ -593,6 +615,408 @@
+     resetDuel();
+ }
+ 
++bool DuelFieldMode::toggleFusionPick() {
++    if (
++        isDuelFinished() ||
++        cardPlayedThisTurn_ ||
++        playerHand_.isEmpty() ||
++        selectedHandPosition_ >= playerHand_.size()
++    ) {
++        return false;
++    }
++
++    const int position =
++        static_cast<int>(selectedHandPosition_);
++
++    for (int i = 0; i < fusionPickCount_; i++) {
++        if (fusionPicks_[i] != position) {
++            continue;
++        }
++
++        /* ja marcada: desmarca e mantem a ordem das demais */
++        for (int k = i; k + 1 < fusionPickCount_; k++) {
++            fusionPicks_[k] = fusionPicks_[k + 1];
++        }
++
++        fusionPickCount_--;
++
++        return true;
++    }
++
++    if (fusionPickCount_ >= 5) {
++        return false;
++    }
++
++    fusionPicks_[fusionPickCount_] = position;
++    fusionPickCount_++;
++
++    return true;
++}
++
++bool DuelFieldMode::clearFusionPicks() {
++    if (fusionPickCount_ == 0) {
++        return false;
++    }
++
++    fusionPickCount_ = 0;
++
++    return true;
++}
++
++bool DuelFieldMode::beginPlaySelection() {
++    if (
++        isDuelFinished() ||
++        cardPlayedThisTurn_ ||
++        summonSelectionActive_ ||
++        playerHand_.isEmpty() ||
++        selectedHandPosition_ >= playerHand_.size()
++    ) {
++        return false;
++    }
++
++    /* cartas marcadas com Y: invocacao por fusao em cadeia */
++    if (fusionPickCount_ > 0) {
++        return beginChainSummonSelection();
++    }
++
++    const CardData* card =
++        GameData_GetCardByIndex(
++            static_cast<int>(
++                playerHand_.cardAt(
++                    selectedHandPosition_
++                )
++            )
++        );
++
++    if (card == nullptr) {
++        return false;
++    }
++
++    /* carta de terreno (ids 330-335): joga na hora */
++    if (
++        card->type == 20 &&
++        card->id >= DUEL_FIRST_TERRAIN_CARD_ID &&
++        card->id < DUEL_FIRST_TERRAIN_CARD_ID + DUEL_TERRAIN_COUNT
++    ) {
++        return playTerrainFromHand();
++    }
++
++    /* equip: escolhe o monstro em campo que vai recebe-lo */
++    if (card->type == 23) {
++        return beginEquipSelection();
++    }
++
++    return beginSummonSelection();
++}
++
++bool DuelFieldMode::beginChainSummonSelection() {
++    if (
++        summonSelectionActive_ ||
++        fusionPickCount_ <= 0
++    ) {
++        return false;
++    }
++
++    int slots[5];
++
++    for (int i = 0; i < fusionPickCount_; i++) {
++        slots[i] =
++            DuelEngine_FindPlayerHandSlotByOrder(
++                fusionPicks_[i]
++            );
++
++        if (slots[i] < 0) {
++            return false;
++        }
++    }
++
++    int resultId = 0;
++
++    if (!DuelEngine_PreviewFuseChain(
++        slots,
++        fusionPickCount_,
++        &resultId,
++        nullptr,
++        nullptr,
++        nullptr
++    )) {
++        return false;
++    }
++
++    const CardData* result =
++        GameData_GetCardById(resultId);
++
++    /* o resultado precisa ser um monstro para ir ao campo */
++    if (
++        result == nullptr ||
++        result->type >= 20
++    ) {
++        return false;
++    }
++
++    confirmedCardIndex_ =
++        static_cast<std::uint16_t>(
++            resultId - 1
++        );
++    confirmedZoneIndex_ =
++        kInvalidZoneIndex;
++    cardConfirmed_ = true;
++    summonSelectionActive_ = true;
++    summonTargetConfirmed_ = false;
++    selectedSummonPosition_ =
++        MonsterPosition::Attack;
++
++    if (!selectFirstAvailableMonsterZone()) {
++        clearSummonState();
++        return false;
++    }
++
++    return true;
++}
++
++bool DuelFieldMode::commitChainSummon() {
++    if (
++        isDuelFinished() ||
++        cardPlayedThisTurn_ ||
++        !summonSelectionActive_ ||
++        !summonTargetConfirmed_ ||
++        fusionPickCount_ <= 0 ||
++        confirmedZoneIndex_ ==
++            kInvalidZoneIndex
++    ) {
++        return false;
++    }
++
++    FieldZone* targetZone =
++        field_.zone(
++            confirmedZoneIndex_
++        );
++
++    if (
++        !isValidSummonZone(
++            targetZone
++        ) ||
++        selectedSummonSlot_ < 0 ||
++        selectedSummonSlot_ >=
++            kMonsterZoneCount
++    ) {
++        return false;
++    }
++
++    int slots[5];
++
++    for (int i = 0; i < fusionPickCount_; i++) {
++        slots[i] =
++            DuelEngine_FindPlayerHandSlotByOrder(
++                fusionPicks_[i]
++            );
++
++        if (slots[i] < 0) {
++            return false;
++        }
++    }
++
++    const DuelPosition enginePosition =
++        selectedSummonPosition_ ==
++            MonsterPosition::Defense
++                ? DUEL_POSITION_DEFENSE
++                : DUEL_POSITION_ATTACK;
++
++    if (!DuelEngine_FuseChainFromHand(
++        slots,
++        fusionPickCount_,
++        selectedSummonSlot_,
++        enginePosition
++    )) {
++        return false;
++    }
++
++    cardPlayedThisTurn_ = true;
++
++    DuelEngine_SetGuardianStar(
++        selectedSummonSlot_,
++        selectedGuardianChoice_
++    );
++
++    synchronizeMonsterFieldsFromEngine();
++    synchronizeHandFromEngine();
++
++    cursor_.selectZone(
++        targetZone->index()
++    );
++
++    clearSummonState();
++
++    return true;
++}
++
++bool DuelFieldMode::playTerrainFromHand() {
++    const int slot =
++        DuelEngine_FindPlayerHandSlotByOrder(
++            static_cast<int>(
++                selectedHandPosition_
++            )
++        );
++
++    if (
++        slot < 0 ||
++        !DuelEngine_PlayFieldMagicFromHand(slot)
++    ) {
++        return false;
++    }
++
++    cardPlayedThisTurn_ = true;
++
++    synchronizeHandFromEngine();
++
++    return true;
++}
++
++int DuelFieldMode::equipCardId() {
++    const DuelState* state =
++        DuelEngine_GetState();
++
++    const int slot =
++        DuelEngine_FindPlayerHandSlotByOrder(
++            equipHandPosition_
++        );
++
++    if (state == nullptr || slot < 0) {
++        return 0;
++    }
++
++    return state->player.hand.cards[slot];
++}
++
++int DuelFieldMode::findEquipTarget(
++    int start,
++    int direction
++) {
++    const DuelState* state =
++        DuelEngine_GetState();
++
++    const int equipId =
++        equipCardId();
++
++    if (state == nullptr || equipId == 0) {
++        return -1;
++    }
++
++    for (int attempt = 1; attempt <= DUEL_FIELD_SIZE; attempt++) {
++        int candidate =
++            (start + direction * attempt) %
++            DUEL_FIELD_SIZE;
++
++        if (candidate < 0) {
++            candidate += DUEL_FIELD_SIZE;
++        }
++
++        const std::uint16_t monsterId =
++            state->player.field[candidate].cardId;
++
++        if (
++            monsterId != 0 &&
++            EquipEngine_CanEquip(
++                equipId,
++                monsterId
++            )
++        ) {
++            return candidate;
++        }
++    }
++
++    return -1;
++}
++
++bool DuelFieldMode::beginEquipSelection() {
++    if (equipSelectionActive_) {
++        return false;
++    }
++
++    equipHandPosition_ =
++        static_cast<int>(
++            selectedHandPosition_
++        );
++
++    const int first =
++        findEquipTarget(-1, 1);
++
++    if (first < 0) {
++        return false;
++    }
++
++    equipTargetSlot_ = first;
++    equipSelectionActive_ = true;
++
++    return true;
++}
++
++bool DuelFieldMode::moveEquipTarget(int direction) {
++    if (!equipSelectionActive_) {
++        return false;
++    }
++
++    const int next =
++        findEquipTarget(
++            equipTargetSlot_,
++            direction
++        );
++
++    if (next < 0 || next == equipTargetSlot_) {
++        return false;
++    }
++
++    equipTargetSlot_ = next;
++
++    return true;
++}
++
++bool DuelFieldMode::commitEquip() {
++    if (
++        !equipSelectionActive_ ||
++        equipTargetSlot_ < 0 ||
++        isDuelFinished() ||
++        cardPlayedThisTurn_
++    ) {
++        return false;
++    }
++
++    const int slot =
++        DuelEngine_FindPlayerHandSlotByOrder(
++            equipHandPosition_
++        );
++
++    if (
++        slot < 0 ||
++        !DuelEngine_EquipFromHand(
++            slot,
++            equipTargetSlot_
++        )
++    ) {
++        return false;
++    }
++
++    cardPlayedThisTurn_ = true;
++    equipSelectionActive_ = false;
++    equipTargetSlot_ = -1;
++
++    synchronizeMonsterFieldsFromEngine();
++    synchronizeHandFromEngine();
++
++    return true;
++}
++
++bool DuelFieldMode::cancelEquipSelection() {
++    if (!equipSelectionActive_) {
++        return false;
++    }
++
++    equipSelectionActive_ = false;
++    equipTargetSlot_ = -1;
++
++    return true;
++}
++
+ bool DuelFieldMode::selectFirstAvailableMonsterZone() {
+     for (
+         int slot = 0;
+@@ -1460,6 +1884,39 @@
+         return;
+     }
+ 
++    /* escolhendo em qual monstro do campo colocar o equip */
++    if (equipSelectionActive_) {
++        if (pressed & KEY_LEFT) {
++            changed =
++                moveEquipTarget(-1) ||
++                changed;
++        }
++
++        if (pressed & KEY_RIGHT) {
++            changed =
++                moveEquipTarget(1) ||
++                changed;
++        }
++
++        if (pressed & KEY_A) {
++            changed =
++                commitEquip() ||
++                changed;
++        }
++
++        if (pressed & KEY_B) {
++            changed =
++                cancelEquipSelection() ||
++                changed;
++        }
++
++        if (changed) {
++            redraw();
++        }
++
++        return;
++    }
++
+     if (attackSelectionActive_) {
+         if (pressed & KEY_LEFT) {
+             changed =
+@@ -1499,7 +1956,20 @@
+ 
+         if (pressed & KEY_A) {
+             changed =
+-                beginSummonSelection() ||
++                beginPlaySelection() ||
++                changed;
++        }
++
++        /* Y marca/desmarca a carta para fusao (ordem de marcacao); B ou BAIXO limpa */
++        if (pressed & KEY_Y) {
++            changed =
++                toggleFusionPick() ||
++                changed;
++        }
++
++        if (pressed & (KEY_B | KEY_DOWN)) {
++            changed =
++                clearFusionPicks() ||
+                 changed;
+         }
+ 
+@@ -1710,6 +2180,25 @@
+             selectedGuardianChoice_
+         );
+     }
++
++    DuelOverlay_DrawTerrainBadge(
++        DuelEngine_GetTerrain()
++    );
++
++    if (equipSelectionActive_) {
++        DuelOverlay_DrawEquipPanel(
++            equipCardId(),
++            equipTargetSlot_
++        );
++    } else if (
++        !summonSelectionActive_ &&
++        fusionPickCount_ > 0
++    ) {
++        DuelOverlay_DrawFusionPanel(
++            fusionPicks_,
++            fusionPickCount_
++        );
++    }
+ bgUpdate();
+ }
+ 
+diff -u -r -N source.l5/duel/DuelOverlays.cpp source/duel/DuelOverlays.cpp
+--- source.l5/duel/DuelOverlays.cpp	2026-10-24 00:15:56.005899118 +0000
++++ source/duel/DuelOverlays.cpp	2026-10-24 00:18:45.161527861 +0000
+@@ -18,6 +18,16 @@
+ constexpr int kStarPanelWidth = 100;
+ constexpr int kStarPanelHeight = 42;
+ 
++constexpr int kInfoPanelX = 4;
++constexpr int kInfoPanelY = 24;
++constexpr int kInfoPanelWidth = 148;
++
++/* Selo do terreno: vao entre o LP da CPU e o painel de estrelas. */
++constexpr int kBadgeX = 102;
++constexpr int kBadgeY = 4;
++constexpr int kBadgeWidth = 48;
++constexpr int kBadgeHeight = 13;
++
+ constexpr int kMenuListY = 26;
+ constexpr int kMenuRowHeight = 12;
+ constexpr int kMenuVisibleRows = 12;
+@@ -79,6 +89,174 @@
+     PixelText_Draw(kStarPanelX + 4, y, line, textColor);
+ }
+ 
++namespace {
++
++/* Copia ate `limit` caracteres do nome (a fonte e larga: 8 px por letra). */
++void copyName(char* out, std::size_t size, const char* name, int limit) {
++    std::snprintf(out, size, "%.*s", limit, name != nullptr ? name : "");
++}
++
++void drawInfoPanel(int lineCount) {
++    const int height = lineCount * 12 + 6;
++
++    PixelText_Fill(
++        kInfoPanelX, kInfoPanelY, kInfoPanelWidth, height,
++        PixelText_Color(2, 3, 8)
++    );
++    PixelText_Frame(
++        kInfoPanelX, kInfoPanelY, kInfoPanelWidth, height,
++        PixelText_Color(8, 24, 12)
++    );
++}
++
++int clampStat(int value) {
++    if (value < 0) {
++        return 0;
++    }
++
++    return value > DUEL_STAT_MAX ? DUEL_STAT_MAX : value;
++}
++
++}
++
++void DuelOverlay_DrawTerrainBadge(int terrain) {
++    static const char* const names[] = {
++        "", "FOREST", "WASTELAND", "MOUNTAIN", "SOGEN", "UMI", "YAMI"
++    };
++
++    if (terrain < 1 || terrain > DUEL_TERRAIN_COUNT) {
++        return;
++    }
++
++    PixelText_Fill(
++        kBadgeX, kBadgeY, kBadgeWidth, kBadgeHeight,
++        PixelText_Color(2, 8, 4)
++    );
++    PixelText_Frame(
++        kBadgeX, kBadgeY, kBadgeWidth, kBadgeHeight,
++        PixelText_Color(8, 24, 12)
++    );
++
++    /* escala 1 (4 px por letra) para caber WASTELAND no selo */
++    PixelText_Draw(
++        kBadgeX + (kBadgeWidth - PixelText_Width(names[terrain], 1)) / 2,
++        kBadgeY + 4,
++        names[terrain],
++        PixelText_Color(31, 31, 31),
++        1
++    );
++}
++
++void DuelOverlay_DrawFusionPanel(const int* pickPositions, int count) {
++    if (pickPositions == nullptr || count < 1 || count > DUEL_HAND_SIZE) {
++        return;
++    }
++
++    int slots[DUEL_HAND_SIZE];
++
++    for (int i = 0; i < count; i++) {
++        slots[i] = DuelEngine_FindPlayerHandSlotByOrder(pickPositions[i]);
++
++        if (slots[i] < 0) {
++            return;
++        }
++    }
++
++    int resultId = 0;
++    int attackBonus = 0;
++    int defenseBonus = 0;
++    unsigned failedMask = 0;
++
++    if (!DuelEngine_PreviewFuseChain(
++        slots, count, &resultId, &attackBonus, &defenseBonus, &failedMask
++    )) {
++        return;
++    }
++
++    const u16 textColor = PixelText_Color(31, 31, 31);
++    const u16 warnColor = PixelText_Color(31, 14, 10);
++    const u16 goodColor = PixelText_Color(18, 31, 20);
++
++    drawInfoPanel(3);
++
++    char line[40];
++    int used = std::snprintf(line, sizeof(line), "%s ", failedMask ? "FAIL" : "FUSE");
++
++    for (int i = 0; i < count && used < 30; i++) {
++        used += std::snprintf(
++            line + used, sizeof(line) - used, i ? ">%d" : "%d", pickPositions[i] + 1
++        );
++    }
++
++    PixelText_Draw(kInfoPanelX + 4, kInfoPanelY + 3, line, failedMask ? warnColor : goodColor);
++
++    const CardData* result = GameData_GetCardById(resultId);
++
++    if (result == nullptr) {
++        return;
++    }
++
++    copyName(line, sizeof(line), result->name, 17);
++    PixelText_Draw(kInfoPanelX + 4, kInfoPanelY + 15, line, textColor);
++
++    if (result->type >= DUEL_FIRST_NON_MONSTER_TYPE) {
++        PixelText_Draw(kInfoPanelX + 4, kInfoPanelY + 27, "NOT A MONSTER", warnColor);
++        return;
++    }
++
++    const int terrainBoost = DuelEngine_GetTerrainBoost(result->type, DuelEngine_GetTerrain());
++
++    std::snprintf(
++        line, sizeof(line), "ATK %d DEF %d",
++        clampStat(result->attack + attackBonus + terrainBoost),
++        clampStat(result->defense + defenseBonus + terrainBoost)
++    );
++    PixelText_Draw(kInfoPanelX + 4, kInfoPanelY + 27, line, textColor);
++}
++
++void DuelOverlay_DrawEquipPanel(int equipCardId, int fieldSlot) {
++    const DuelState* state = DuelEngine_GetState();
++    const CardData* equip = GameData_GetCardById(equipCardId);
++
++    if (
++        state == nullptr || equip == nullptr ||
++        fieldSlot < 0 || fieldSlot >= DUEL_FIELD_SIZE
++    ) {
++        return;
++    }
++
++    const CardData* monster = GameData_GetCardById(state->player.field[fieldSlot].cardId);
++
++    if (monster == nullptr) {
++        return;
++    }
++
++    const int bonus = DuelEngine_GetEquipBonus(equipCardId);
++    const int attack = DuelEngine_GetFieldAttack(false, fieldSlot);
++    const int defense = DuelEngine_GetFieldDefense(false, fieldSlot);
++
++    const u16 textColor = PixelText_Color(31, 31, 31);
++
++    drawInfoPanel(4);
++
++    char line[40];
++    char name[24];
++
++    copyName(name, sizeof(name), equip->name, 11);
++    std::snprintf(line, sizeof(line), "EQUIP %s", name);
++    PixelText_Draw(kInfoPanelX + 4, kInfoPanelY + 3, line, PixelText_Color(18, 31, 20));
++
++    copyName(name, sizeof(name), monster->name, 14);
++    std::snprintf(line, sizeof(line), "ON %s", name);
++    PixelText_Draw(kInfoPanelX + 4, kInfoPanelY + 15, line, textColor);
++
++    std::snprintf(line, sizeof(line), "ATK %d>%d", attack, clampStat(attack + bonus));
++    PixelText_Draw(kInfoPanelX + 4, kInfoPanelY + 27, line, textColor);
++
++    std::snprintf(line, sizeof(line), "DEF %d>%d", defense, clampStat(defense + bonus));
++    PixelText_Draw(kInfoPanelX + 4, kInfoPanelY + 39, line, textColor);
++}
++
+ void DuelOverlay_DrawDuelistMenu(int selectedIndex) {
+     const int count = GameData_GetDuelistCount();
+ 
+diff -u -r -N source.l5/duel/PixelFont.cpp source/duel/PixelFont.cpp
+--- source.l5/duel/PixelFont.cpp	2026-10-24 00:15:56.005688970 +0000
++++ source/duel/PixelFont.cpp	2026-10-24 00:18:45.159249423 +0000
+@@ -33,6 +33,8 @@
+     {':', "000010000010000"}, {'.', "000000000000010"},
+     {'>', "100010001010100"}, {'/', "001001010100100"},
+     {'+', "000010111010000"},
++    {'\'', "010010000000000"}, {'#', "101111101111101"},
++    {',', "000000000010100"}, {'!', "010010010000010"},
+ };
+ 
+ constexpr int kGlyphCount =

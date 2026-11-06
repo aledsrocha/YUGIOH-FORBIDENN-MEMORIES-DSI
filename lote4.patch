@@ -1,0 +1,252 @@
+diff -u -r -N include.l3/DuelEngine.h include/DuelEngine.h
+--- include.l3/DuelEngine.h	2026-10-23 08:10:09.169482975 +0000
++++ include/DuelEngine.h	2026-10-23 08:10:28.603427429 +0000
+@@ -13,6 +13,11 @@
+ /* cartas com type >= 20 (Magic, Trap, Ritual, Equip) nao sao monstros */
+ #define DUEL_FIRST_NON_MONSTER_TYPE 20
+ 
++/* Teto de ATK/DEF (CARD_STAT_MAX do original) e bonus de terreno (+/-500) */
++#define DUEL_STAT_MAX 9999
++#define DUEL_TERRAIN_BONUS 500
++#define DUEL_TERRAIN_COUNT 6
++
+ enum DuelTurn {
+     DUEL_TURN_PLAYER = 0,
+     DUEL_TURN_OPPONENT = 1
+@@ -65,6 +70,8 @@
+     int turnNumber;
+     bool finished;
+     bool playerWon;
++    /* 0 = sem terreno; 1 Forest, 2 Wasteland, 3 Mountain, 4 Sogen, 5 Umi, 6 Yami */
++    uint8_t terrain;
+ };
+ 
+ bool DuelEngine_Start(
+@@ -156,6 +163,22 @@
+ */
+ bool DuelEngine_GuardianStarBeats(int star, int otherStar);
+ 
++/*
++    Bonus assinado do confronto de estrelas, portado de Duel_CalcGuardianStarMatchup
++    do jogo original: +500 se `star` vence `otherStar`, -500 se perde, 0 caso contrario
++    (e 0 para estrelas fora de 1..10). No original o bonus vai SO no atacante;
++    o defensor usa o valor cru.
++*/
++int DuelEngine_GuardianStarMatchup(int star, int otherStar);
++
++/*
++    Terrenos (tabela de gDuel_aTerrainBoost do original): ajuste de ATK e DEF
++    de um monstro de `cardType` (0..19) no terreno 1..6; 0 fora disso.
++*/
++int DuelEngine_GetTerrainBoost(int cardType, int terrain);
++void DuelEngine_SetTerrain(int terrain);
++int DuelEngine_GetTerrain();
++
+ /* Nome em maiusculas ("MARS".."VENUS"); "" se a estrela for invalida. */
+ const char* DuelEngine_GuardianStarName(int star);
+ 
+diff -u -r -N source.l3/DuelEngine.cpp source/DuelEngine.cpp
+--- source.l3/DuelEngine.cpp	2026-10-23 08:10:09.165506351 +0000
++++ source/DuelEngine.cpp	2026-10-23 08:10:28.606444937 +0000
+@@ -161,6 +161,34 @@
+     }
+ }
+ 
++/*
++    Ajuste de terreno por tipo de carta (linha) e terreno (coluna), em unidades de
++    DUEL_TERRAIN_BONUS. Gerada da tabela gDuel_aTerrainBoost do jogo original
++    (colunas: Forest, Wasteland, Mountain, Sogen, Umi, Yami).
++*/
++static const int8_t kTerrainBoost[DUEL_FIRST_NON_MONSTER_TYPE][DUEL_TERRAIN_COUNT] = {
++    { 0,  0,  1,  0,  0,  0},
++    { 0,  0,  0,  0,  0,  1},
++    { 0,  1,  0,  0,  0,  0},
++    { 0,  0,  0,  1,  0,  0},
++    { 1,  0,  0,  1,  0,  0},
++    { 1,  0,  0,  0,  0,  0},
++    { 0,  0,  1,  0,  0,  0},
++    { 0,  0,  0,  0,  0,  1},
++    { 0,  0,  0,  0,  0, -1},
++    { 1,  0,  0,  0,  0,  0},
++    { 0,  1,  0,  0,  0,  0},
++    { 0,  0,  0,  0,  0,  0},
++    { 0,  0,  0,  0,  1,  0},
++    { 0,  0,  0,  0,  1,  0},
++    { 0,  0,  0,  0, -1,  0},
++    { 0,  0,  1,  0,  1,  0},
++    { 0,  0,  0,  0,  1,  0},
++    { 0,  0,  0,  0, -1,  0},
++    { 0,  1,  0,  0,  0,  0},
++    { 1,  0,  0,  0,  0,  0}
++};
++
+ static int GetFieldPower(
+     const DuelPlayerState* owner,
+     int fieldIndex,
+@@ -182,11 +210,22 @@
+ 
+     if (!card) return 0;
+ 
+-    if (attack) {
+-        return card->attack + fieldCard->attackBonus;
++    /* original: base + equips + terreno, nos dois lados, limitado a 0..9999 */
++    int value = attack
++        ? card->attack + fieldCard->attackBonus
++        : card->defense + fieldCard->defenseBonus;
++
++    value += DuelEngine_GetTerrainBoost(card->type, duel.terrain);
++
++    if (value < 0) {
++        value = 0;
++    }
++
++    if (value > DUEL_STAT_MAX) {
++        value = DUEL_STAT_MAX;
+     }
+ 
+-    return card->defense + fieldCard->defenseBonus;
++    return value;
+ }
+ 
+ static bool ResolveBattle(
+@@ -250,25 +289,23 @@
+     attacker->hasAttacked = true;
+ 
+     /*
+-        Estrela guardia: so um lado pode ganhar o bonus (a relacao e
+-        antissimetrica). [a confirmar: se vale com defensor virado]
++        Estrela guardia (Duel_CalcBattleAttack do original): o bonus assinado
++        (+500 vence, -500 perde) vai SO no atacante; o defensor usa o valor cru.
++        O resultado final e o mesmo de dar +500 ao lado vencedor.
+     */
+-    int defenderStarBonus = 0;
+-
+-    if (DuelEngine_GuardianStarBeats(
++    attackerPower +=
++        DuelEngine_GuardianStarMatchup(
+             attacker->guardianStar,
+-            defender->guardianStar)) {
+-        attackerPower += DUEL_GUARDIAN_STAR_BONUS;
+-    } else if (DuelEngine_GuardianStarBeats(
+-            defender->guardianStar,
+-            attacker->guardianStar)) {
+-        defenderStarBonus = DUEL_GUARDIAN_STAR_BONUS;
++            defender->guardianStar
++        );
++
++    if (attackerPower > DUEL_STAT_MAX) {
++        attackerPower = DUEL_STAT_MAX;
+     }
+ 
+     if (defender->position == DUEL_POSITION_ATTACK) {
+         int defenderPower =
+-            GetFieldPower(defenderOwner, targetIndex, true) +
+-            defenderStarBonus;
++            GetFieldPower(defenderOwner, targetIndex, true);
+ 
+         int difference = attackerPower - defenderPower;
+ 
+@@ -284,8 +321,7 @@
+         }
+     } else {
+         int defenderPower =
+-            GetFieldPower(defenderOwner, targetIndex, false) +
+-            defenderStarBonus;
++            GetFieldPower(defenderOwner, targetIndex, false);
+ 
+         int difference = attackerPower - defenderPower;
+ 
+@@ -909,26 +945,82 @@
+ 
+ 
+ bool DuelEngine_GuardianStarBeats(int star, int otherStar) {
++    return DuelEngine_GuardianStarMatchup(star, otherStar) > 0;
++}
++
++int DuelEngine_GuardianStarMatchup(int star, int otherStar) {
+     if (star < 1 || star > 10 || otherStar < 1 || otherStar > 10) {
+-        return false;
++        return 0;
+     }
+ 
+-    /* grupo 1: Marte..Netuno (1..6) | grupo 2: Mercurio..Venus (7..10) */
+-    bool firstGroup = star <= 6;
++    /* aritmetica de Duel_CalcGuardianStarMatchup: ciclos 1-6 e 7-10 */
++    int a0 = star - 7;
++    int a1 = otherStar;
++    int cycle;
+ 
+-    if (firstGroup != (otherStar <= 6)) {
+-        return false;
+-    }
++    if (a0 >= 0) {
++        a1 -= 7;
+ 
+-    int next;
++        if (a1 < 0) {
++            return 0;
++        }
+ 
+-    if (firstGroup) {
+-        next = (star == 6) ? 1 : star + 1;
++        cycle = 4;
+     } else {
+-        next = (star == 10) ? 7 : star + 1;
++        cycle = 6;
++        a1 -= 1;
++        a0 += cycle;
++
++        if (a1 >= cycle) {
++            return 0;
++        }
++    }
++
++    a0 += 1;
++
++    if (a0 >= cycle) {
++        a0 = 0;
++    }
++
++    if (a0 == a1) {
++        return DUEL_GUARDIAN_STAR_BONUS;
++    }
++
++    a0 -= 2;
++
++    if (a0 < 0) {
++        a0 += cycle;
++    }
++
++    if (a0 == a1) {
++        return -DUEL_GUARDIAN_STAR_BONUS;
+     }
+ 
+-    return otherStar == next;
++    return 0;
++}
++
++int DuelEngine_GetTerrainBoost(int cardType, int terrain) {
++    if (
++        terrain < 1 ||
++        terrain > DUEL_TERRAIN_COUNT ||
++        cardType < 0 ||
++        cardType >= DUEL_FIRST_NON_MONSTER_TYPE
++    ) {
++        return 0;
++    }
++
++    return kTerrainBoost[cardType][terrain - 1] * DUEL_TERRAIN_BONUS;
++}
++
++void DuelEngine_SetTerrain(int terrain) {
++    duel.terrain =
++        (terrain >= 0 && terrain <= DUEL_TERRAIN_COUNT)
++            ? static_cast<uint8_t>(terrain)
++            : 0;
++}
++
++int DuelEngine_GetTerrain() {
++    return duel.terrain;
+ }
+ 
+ bool DuelEngine_SetGuardianStar(int fieldIndex, int choice) {

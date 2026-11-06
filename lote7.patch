@@ -1,0 +1,639 @@
+diff -u -r -N include.l6/DuelEngine.h include/DuelEngine.h
+--- include.l6/DuelEngine.h	2026-10-24 11:20:59.556224566 +0000
++++ include/DuelEngine.h	2026-10-24 16:18:14.592338982 +0000
+@@ -67,6 +67,8 @@
+     DuelHand hand;
+     DuelFieldCard field[DUEL_FIELD_SIZE];
+     int lifePoints;
++    /* Swords of Revealing Light: 4 ao ser jogada, cai 1 a cada turno deste lado; ataca so em 0 */
++    int swordsTurnsRemaining;
+ };
+ 
+ struct DuelState {
+@@ -241,6 +243,28 @@
+ };
+ int DuelEngine_GetCardEffectGroup(int cardId);
+ 
++#define DUEL_SWORDS_INITIAL_COUNTER 4
++
++/* Resumo do que uma magia fez, para a interface mostrar. */
++struct DuelSpellOutcome {
++    int effectGroup;  /* DuelEffectGroup */
++    int amount;       /* LP curado/causado, penalidade, terreno (1..6) ou turnos de Swords */
++    int affected;     /* monstros atingidos (revelados, penalizados, curados, virados) */
++    int destroyed;    /* monstros destruidos */
++};
++
++/*
++    Joga uma carta de Magic da mao com os efeitos do jogo original (valores e textos
++    conferidos no proprio jogo): terrenos, cura (200/500/1000/2000/5000), dano direto
++    (50/100/200/500/1000), Dark Hole, Dragon Capture Jar, Raigeki, remocao por tipo ou
++    ATK 1500+ (Crush Card), Stop Defense, Dark-piercing Light, Spellbinding Circle (-500),
++    Shadow Spell (-1000), Swords of Revealing Light, Cursebreaker e Harpie's Feather Duster.
++    Rituais, armadilhas e equips tem fluxo proprio (false aqui). `outcome` e opcional.
++*/
++bool DuelEngine_PlaySpellFromHand(int handIndex, DuelSpellOutcome* outcome);
++
++/* Turnos restantes de Swords sobre o lado (0 = livre para atacar). */
++int DuelEngine_GetSwordsTurns(bool opponent);
+ /* Nome em maiusculas ("MARS".."VENUS"); "" se a estrela for invalida. */
+ const char* DuelEngine_GuardianStarName(int star);
+ 
+diff -u -r -N include.l6/duel/DuelFieldMode.h include/duel/DuelFieldMode.h
+--- include.l6/duel/DuelFieldMode.h	2026-10-24 11:20:59.554977141 +0000
++++ include/duel/DuelFieldMode.h	2026-10-24 16:20:36.725414803 +0000
+@@ -47,7 +47,7 @@
+     bool beginPlaySelection();
+     bool beginChainSummonSelection();
+     bool commitChainSummon();
+-    bool playTerrainFromHand();
++    bool playMagicFromHand();
+     bool beginEquipSelection();
+     int findEquipTarget(int start, int direction);
+     bool moveEquipTarget(int direction);
+@@ -194,6 +194,9 @@
+     bool equipSelectionActive_ = false;
+     int equipHandPosition_ = 0;
+     int equipTargetSlot_ = -1;
++    bool bannerActive_ = false;
++    int bannerCardId_ = 0;
++    DuelSpellOutcome bannerOutcome_ = {0, 0, 0, 0};
+     bool initialized_ = false;
+ };
+ 
+diff -u -r -N include.l6/duel/DuelOverlays.h include/duel/DuelOverlays.h
+--- include.l6/duel/DuelOverlays.h	2026-10-24 11:20:59.556107629 +0000
++++ include/duel/DuelOverlays.h	2026-10-24 16:20:36.723038649 +0000
+@@ -1,7 +1,7 @@
+ #pragma once
+ 
++#include "DuelEngine.h"
+ #include "GameData.h"
+-
+ namespace YGOFM {
+ 
+ /*
+@@ -21,6 +21,12 @@
+ */
+ void DuelOverlay_DrawFusionPanel(const int* pickPositions, int count);
+ 
++/* Aviso no meio da tela com o resultado de uma magia recem-jogada. */
++void DuelOverlay_DrawSpellBanner(int cardId, const DuelSpellOutcome& outcome);
++
++/* Selos de Swords of Revealing Light (quem esta impedido de atacar e por quantos turnos). */
++void DuelOverlay_DrawSwordsBadges();
++
+ /* Painel de equipar um monstro em campo: stats antes e depois. */
+ void DuelOverlay_DrawEquipPanel(int equipCardId, int fieldSlot);
+ 
+diff -u -r -N source.l6/DuelEngine.cpp source/DuelEngine.cpp
+--- source.l6/DuelEngine.cpp	2026-10-24 11:20:59.551740886 +0000
++++ source/DuelEngine.cpp	2026-10-24 16:18:14.593620227 +0000
+@@ -421,6 +421,11 @@
+ }
+ 
+ static void OpponentAttackAutomatically() {
++    /* Swords of Revealing Light: o lado afetado nao ataca enquanto o contador for > 0 */
++    if (duel.opponent.swordsTurnsRemaining != 0) {
++        return;
++    }
++
+     for (
+         int attackerIndex = 0;
+         attackerIndex < DUEL_FIELD_SIZE;
+@@ -453,6 +458,11 @@
+ }
+ 
+ static void ExecuteOpponentTurn() {
++    /* o contador de Swords cai 1 no inicio do turno do lado afetado */
++    if (duel.opponent.swordsTurnsRemaining > 0) {
++        duel.opponent.swordsTurnsRemaining--;
++    }
++
+     OpponentSummonAutomatically();
+     OpponentAttackAutomatically();
+ 
+@@ -467,8 +477,11 @@
+ 
+     duel.turn = DUEL_TURN_PLAYER;
+     duel.turnNumber++;
+-
+     ResetAttackFlags(&duel.player);
++
++    if (duel.player.swordsTurnsRemaining > 0) {
++        duel.player.swordsTurnsRemaining--;
++    }
+ }
+ 
+ bool DuelEngine_Start(
+@@ -808,7 +821,9 @@
+     if (duel.finished || duel.turn != DUEL_TURN_PLAYER) {
+         return false;
+     }
+-
++    if (duel.player.swordsTurnsRemaining != 0) {
++        return false;
++    }
+     return ResolveBattle(
+         &duel.player,
+         &duel.opponent,
+@@ -1399,3 +1414,267 @@
+ 
+     return kGroupByEffectIndex[index];
+ }
++
++
++int DuelEngine_GetSwordsTurns(bool opponent) {
++    return opponent
++        ? duel.opponent.swordsTurnsRemaining
++        : duel.player.swordsTurnsRemaining;
++}
++
++namespace {
++
++/* Cura e dano direto do jogo original, por carta (338-342 e 343-347) */
++const int kLifeRecovery[5] = {200, 500, 1000, 2000, 5000};
++const int kDirectDamage[5] = {50, 100, 200, 500, 1000};
++
++/* Tipo de monstro destruido por cada magia de remocao (Crush Card usa ATK) */
++int RemovalType(int cardId) {
++    switch (cardId) {
++        case 653: return 3;   /* Warrior Elimination: Warrior */
++        case 656: return 2;   /* Eternal Rest: Zombie */
++        case 660: return 14;  /* Stain Storm: Machine */
++        case 662: return 9;   /* Eradicating Aerosol: Insect */
++        case 663: return 18;  /* Breath of Light: Rock */
++        case 664: return 12;  /* Eternal Draught: Fish */
++        default: return -1;
++    }
++}
++
++constexpr int kCrushCardCardId = 661;
++constexpr int kCrushCardAttack = 1500;
++constexpr int kDragonCaptureJarCardId = 329;
++constexpr int kSpellbindingCircleCardId = 349;
++constexpr int kDragonType = 0;
++
++int Destroy(DuelPlayerState* side, bool (*match)(const DuelPlayerState*, int, int), int arg) {
++    int destroyed = 0;
++
++    for (int i = 0; i < DUEL_FIELD_SIZE; i++) {
++        if (side->field[i].cardId == 0) {
++            continue;
++        }
++
++        if (match(side, i, arg)) {
++            ClearFieldCard(&side->field[i]);
++            destroyed++;
++        }
++    }
++
++    return destroyed;
++}
++
++bool MatchAny(const DuelPlayerState*, int, int) {
++    return true;
++}
++
++bool MatchType(const DuelPlayerState* side, int i, int type) {
++    const CardData* card = GameData_GetCardById(side->field[i].cardId);
++    return card != nullptr && card->type == type;
++}
++
++bool MatchAttackAtLeast(const DuelPlayerState* side, int i, int threshold) {
++    return GetFieldPower(side, i, true) >= threshold;
++}
++
++}
++
++bool DuelEngine_PlaySpellFromHand(int handIndex, DuelSpellOutcome* outcome) {
++    DuelSpellOutcome result = {0, 0, 0, 0};
++
++    if (
++        duel.finished ||
++        duel.turn != DUEL_TURN_PLAYER ||
++        handIndex < 0 ||
++        handIndex >= DUEL_HAND_SIZE
++    ) {
++        return false;
++    }
++
++    const int cardId = duel.player.hand.cards[handIndex];
++    const CardData* card = GameData_GetCardById(cardId);
++
++    /* so cartas Magic (type 20); equips, armadilhas e rituais tem fluxo proprio */
++    if (card == nullptr || card->type != 20) {
++        return false;
++    }
++
++    DuelPlayerState* me = &duel.player;
++    DuelPlayerState* foe = &duel.opponent;
++    const int group = DuelEngine_GetCardEffectGroup(cardId);
++
++    result.effectGroup = group;
++
++    switch (group) {
++        case DUEL_EFFECT_GROUP_TERRAIN: {
++            const int terrain = cardId - DUEL_FIRST_TERRAIN_CARD_ID + 1;
++
++            if (terrain < 1 || terrain > DUEL_TERRAIN_COUNT) {
++                return false;
++            }
++
++            DuelEngine_SetTerrain(terrain);
++            result.amount = terrain;
++            break;
++        }
++
++        case DUEL_EFFECT_GROUP_LIFE_POINT_RECOVERY: {
++            const int index = cardId - 338;
++
++            if (index < 0 || index > 4) {
++                return false;
++            }
++
++            /* sobe ate o maximo (8000), sem reduzir quem ja esta acima */
++            const int ceiling =
++                me->lifePoints > DUEL_START_LP ? me->lifePoints : DUEL_START_LP;
++            int healed = me->lifePoints + kLifeRecovery[index];
++
++            me->lifePoints = healed > ceiling ? ceiling : healed;
++            result.amount = kLifeRecovery[index];
++            break;
++        }
++
++        case DUEL_EFFECT_GROUP_DIRECT_DAMAGE: {
++            const int index = cardId - 343;
++
++            if (index < 0 || index > 4) {
++                return false;
++            }
++
++            foe->lifePoints -= kDirectDamage[index];
++
++            if (foe->lifePoints < 0) {
++                foe->lifePoints = 0;
++            }
++
++            result.amount = kDirectDamage[index];
++            break;
++        }
++
++        case DUEL_EFFECT_GROUP_BOARD_DESTRUCTION:
++            if (cardId == kDragonCaptureJarCardId) {
++                result.destroyed = Destroy(foe, MatchType, kDragonType);
++            } else {
++                result.destroyed =
++                    Destroy(me, MatchAny, 0) +
++                    Destroy(foe, MatchAny, 0);
++            }
++            break;
++
++        case DUEL_EFFECT_GROUP_RAIGEKI:
++            result.destroyed = Destroy(foe, MatchAny, 0);
++            break;
++
++        case DUEL_EFFECT_GROUP_MONSTER_REMOVAL:
++            if (cardId == kCrushCardCardId) {
++                result.destroyed =
++                    Destroy(foe, MatchAttackAtLeast, kCrushCardAttack);
++            } else {
++                const int type = RemovalType(cardId);
++
++                if (type < 0) {
++                    return false;
++                }
++
++                result.destroyed = Destroy(foe, MatchType, type);
++            }
++            break;
++
++        case DUEL_EFFECT_GROUP_STOP_DEFENSE:
++            for (int i = 0; i < DUEL_FIELD_SIZE; i++) {
++                DuelFieldCard& monster = foe->field[i];
++
++                if (monster.cardId != 0 && monster.position == DUEL_POSITION_DEFENSE) {
++                    monster.position = DUEL_POSITION_ATTACK;
++                    result.affected++;
++                }
++            }
++            break;
++
++        case DUEL_EFFECT_GROUP_DARK_PIERCING_LIGHT:
++            for (int i = 0; i < DUEL_FIELD_SIZE; i++) {
++                if (me->field[i].cardId != 0 && !me->field[i].faceUp) {
++                    me->field[i].faceUp = true;
++                    result.affected++;
++                }
++
++                if (foe->field[i].cardId != 0 && !foe->field[i].faceUp) {
++                    foe->field[i].faceUp = true;
++                    result.affected++;
++                }
++            }
++            break;
++
++        case DUEL_EFFECT_GROUP_STAT_PENALTY: {
++            const int penalty =
++                cardId == kSpellbindingCircleCardId
++                    ? DUEL_EQUIP_BONUS
++                    : 2 * DUEL_EQUIP_BONUS;
++
++            for (int i = 0; i < DUEL_FIELD_SIZE; i++) {
++                if (foe->field[i].cardId != 0) {
++                    foe->field[i].attackBonus -= penalty;
++                    foe->field[i].defenseBonus -= penalty;
++                    result.affected++;
++                }
++            }
++
++            result.amount = penalty;
++            break;
++        }
++
++        case DUEL_EFFECT_GROUP_SWORDS:
++            for (int i = 0; i < DUEL_FIELD_SIZE; i++) {
++                if (foe->field[i].cardId != 0 && !foe->field[i].faceUp) {
++                    foe->field[i].faceUp = true;
++                    result.affected++;
++                }
++            }
++
++            foe->swordsTurnsRemaining = DUEL_SWORDS_INITIAL_COUNTER;
++            result.amount = DUEL_SWORDS_INITIAL_COUNTER - 1;
++            break;
++
++        case DUEL_EFFECT_GROUP_CURSEBREAKER:
++            /* so remove penalidades (modificadores negativos); equips continuam */
++            for (int i = 0; i < DUEL_FIELD_SIZE; i++) {
++                DuelFieldCard& monster = me->field[i];
++                bool cured = false;
++
++                if (monster.cardId == 0) {
++                    continue;
++                }
++
++                if (monster.attackBonus < 0) {
++                    monster.attackBonus = 0;
++                    cured = true;
++                }
++
++                if (monster.defenseBonus < 0) {
++                    monster.defenseBonus = 0;
++                    cured = true;
++                }
++
++                result.affected += cured ? 1 : 0;
++            }
++            break;
++
++        case DUEL_EFFECT_GROUP_HARPIES_FEATHER_DUSTER:
++            /* destroi as magias e armadilhas do adversario em campo: ainda nao ha nenhuma */
++            break;
++
++        default:
++            return false;
++    }
++
++    duel.player.hand.cards[handIndex] = 0;
++
++    if (outcome != nullptr) {
++        *outcome = result;
++    }
++
++    CheckLifePoints();
++
++    return true;
++}
+diff -u -r -N source.l6/duel/DuelFieldMode.cpp source/duel/DuelFieldMode.cpp
+--- source.l6/duel/DuelFieldMode.cpp	2026-10-24 11:20:59.550348143 +0000
++++ source/duel/DuelFieldMode.cpp	2026-10-24 16:20:36.728147075 +0000
+@@ -123,6 +123,7 @@
+ 
+     equipSelectionActive_ = false;
+     equipTargetSlot_ = -1;
++    bannerActive_ = false;
+ 
+     /*
+         O DuelEngine e o dono de deck, mao, campo e turnos.
+@@ -692,15 +693,10 @@
+         return false;
+     }
+ 
+-    /* carta de terreno (ids 330-335): joga na hora */
+-    if (
+-        card->type == 20 &&
+-        card->id >= DUEL_FIRST_TERRAIN_CARD_ID &&
+-        card->id < DUEL_FIRST_TERRAIN_CARD_ID + DUEL_TERRAIN_COUNT
+-    ) {
+-        return playTerrainFromHand();
++    /* carta Magic (terrenos, cura, dano, destruicao...): joga na hora */
++    if (card->type == 20) {
++        return playMagicFromHand();
+     }
+-
+     /* equip: escolhe o monstro em campo que vai recebe-lo */
+     if (card->type == 23) {
+         return beginEquipSelection();
+@@ -850,7 +846,7 @@
+     return true;
+ }
+ 
+-bool DuelFieldMode::playTerrainFromHand() {
++bool DuelFieldMode::playMagicFromHand() {
+     const int slot =
+         DuelEngine_FindPlayerHandSlotByOrder(
+             static_cast<int>(
+@@ -858,15 +854,36 @@
+             )
+         );
+ 
++    const DuelState* state =
++        DuelEngine_GetState();
++
++    if (slot < 0 || state == nullptr) {
++        return false;
++    }
++
++    const int cardId =
++        state->player.hand.cards[slot];
++
++    DuelSpellOutcome outcome = {0, 0, 0, 0};
++
+     if (
+-        slot < 0 ||
+-        !DuelEngine_PlayFieldMagicFromHand(slot)
++        cardId == 0 ||
++        !DuelEngine_PlaySpellFromHand(
++            slot,
++            &outcome
++        )
+     ) {
+         return false;
+     }
+ 
+     cardPlayedThisTurn_ = true;
+ 
++    /* aviso com o resultado, ate a proxima tecla */
++    bannerActive_ = true;
++    bannerCardId_ = cardId;
++    bannerOutcome_ = outcome;
++
++    synchronizeMonsterFieldsFromEngine();
+     synchronizeHandFromEngine();
+ 
+     return true;
+@@ -1884,6 +1901,12 @@
+         return;
+     }
+ 
++    /* qualquer tecla fecha o aviso da magia */
++    if (bannerActive_ && pressed != 0) {
++        bannerActive_ = false;
++        changed = true;
++    }
++
+     /* escolhendo em qual monstro do campo colocar o equip */
+     if (equipSelectionActive_) {
+         if (pressed & KEY_LEFT) {
+@@ -2199,6 +2222,15 @@
+             fusionPickCount_
+         );
+     }
++
++    DuelOverlay_DrawSwordsBadges();
++
++    if (bannerActive_) {
++        DuelOverlay_DrawSpellBanner(
++            bannerCardId_,
++            bannerOutcome_
++        );
++    }
+ bgUpdate();
+ }
+ 
+diff -u -r -N source.l6/duel/DuelOverlays.cpp source/duel/DuelOverlays.cpp
+--- source.l6/duel/DuelOverlays.cpp	2026-10-24 11:20:59.551561937 +0000
++++ source/duel/DuelOverlays.cpp	2026-10-24 16:20:36.724708580 +0000
+@@ -119,6 +119,121 @@
+ 
+ }
+ 
++void DuelOverlay_DrawSpellBanner(int cardId, const DuelSpellOutcome& outcome) {
++    static const char* const terrains[] = {
++        "", "FOREST", "WASTELAND", "MOUNTAIN", "SOGEN", "UMI", "YAMI"
++    };
++
++    const CardData* card = GameData_GetCardById(cardId);
++
++    if (card == nullptr) {
++        return;
++    }
++
++    char message[40];
++
++    switch (outcome.effectGroup) {
++        case DUEL_EFFECT_GROUP_TERRAIN:
++            std::snprintf(
++                message, sizeof(message), "FIELD: %s",
++                outcome.amount >= 1 && outcome.amount <= DUEL_TERRAIN_COUNT
++                    ? terrains[outcome.amount] : ""
++            );
++            break;
++        case DUEL_EFFECT_GROUP_LIFE_POINT_RECOVERY:
++            std::snprintf(message, sizeof(message), "YOU RECOVER %d LP", outcome.amount);
++            break;
++        case DUEL_EFFECT_GROUP_DIRECT_DAMAGE:
++            std::snprintf(message, sizeof(message), "CPU LOSES %d LP", outcome.amount);
++            break;
++        case DUEL_EFFECT_GROUP_BOARD_DESTRUCTION:
++        case DUEL_EFFECT_GROUP_RAIGEKI:
++        case DUEL_EFFECT_GROUP_MONSTER_REMOVAL:
++            if (outcome.destroyed > 0) {
++                std::snprintf(message, sizeof(message), "%d DESTROYED", outcome.destroyed);
++            } else {
++                std::snprintf(message, sizeof(message), "NOTHING DESTROYED");
++            }
++            break;
++        case DUEL_EFFECT_GROUP_STOP_DEFENSE:
++            if (outcome.affected > 0) {
++                std::snprintf(message, sizeof(message), "%d TO ATTACK", outcome.affected);
++            } else {
++                std::snprintf(message, sizeof(message), "NO TARGETS");
++            }
++            break;
++        case DUEL_EFFECT_GROUP_DARK_PIERCING_LIGHT:
++            if (outcome.affected > 0) {
++                std::snprintf(message, sizeof(message), "%d REVEALED", outcome.affected);
++            } else {
++                std::snprintf(message, sizeof(message), "NOTHING HIDDEN");
++            }
++            break;
++        case DUEL_EFFECT_GROUP_STAT_PENALTY:
++            std::snprintf(message, sizeof(message), "ENEMIES -%d ATK DEF", outcome.amount);
++            break;
++        case DUEL_EFFECT_GROUP_SWORDS:
++            std::snprintf(message, sizeof(message), "NO ATTACK FOR %d TURNS", outcome.amount);
++            break;
++        case DUEL_EFFECT_GROUP_CURSEBREAKER:
++            if (outcome.affected > 0) {
++                std::snprintf(message, sizeof(message), "%d CURED", outcome.affected);
++            } else {
++                std::snprintf(message, sizeof(message), "NOTHING TO CURE");
++            }
++            break;
++        case DUEL_EFFECT_GROUP_HARPIES_FEATHER_DUSTER:
++            std::snprintf(message, sizeof(message), "NO MAGIC IN PLAY");
++            break;
++        default:
++            message[0] = '\0';
++            break;
++    }
++
++    constexpr int x = 40;
++    constexpr int y = 80;
++    constexpr int width = 176;
++    constexpr int height = 32;
++
++    PixelText_Fill(x, y, width, height, PixelText_Color(2, 3, 8));
++    PixelText_Frame(x, y, width, height, PixelText_Color(28, 22, 6));
++
++    char name[24];
++
++    copyName(name, sizeof(name), card->name, 21);
++    PixelText_Draw(x + 4, y + 4, name, PixelText_Color(18, 31, 20));
++    PixelText_Draw(x + 4, y + 17, message, PixelText_Color(31, 31, 31));
++}
++
++void DuelOverlay_DrawSwordsBadges() {
++    char text[16];
++
++    /* adversario sob Swords: mostra quantos turnos dele ainda ficam sem ataque */
++    const int cpu = DuelEngine_GetSwordsTurns(true);
++
++    if (cpu > 1) {
++        std::snprintf(text, sizeof(text), "SWORDS %d", cpu - 1);
++        PixelText_Fill(kBadgeX, kBadgeY + kBadgeHeight + 2, kBadgeWidth, kBadgeHeight, PixelText_Color(2, 3, 8));
++        PixelText_Frame(kBadgeX, kBadgeY + kBadgeHeight + 2, kBadgeWidth, kBadgeHeight, PixelText_Color(28, 22, 6));
++        PixelText_Draw(
++            kBadgeX + (kBadgeWidth - PixelText_Width(text, 1)) / 2,
++            kBadgeY + kBadgeHeight + 6, text, PixelText_Color(31, 31, 31), 1
++        );
++    }
++
++    /* jogador sob Swords: nao pode atacar neste turno */
++    const int you = DuelEngine_GetSwordsTurns(false);
++
++    if (you > 0) {
++        std::snprintf(text, sizeof(text), "NO ATK %d", you);
++        PixelText_Fill(96, 172, 56, kBadgeHeight, PixelText_Color(8, 2, 2));
++        PixelText_Frame(96, 172, 56, kBadgeHeight, PixelText_Color(31, 10, 8));
++        PixelText_Draw(
++            96 + (56 - PixelText_Width(text, 1)) / 2, 176, text, PixelText_Color(31, 31, 31), 1
++        );
++    }
++}
++
+ void DuelOverlay_DrawTerrainBadge(int terrain) {
+     static const char* const names[] = {
+         "", "FOREST", "WASTELAND", "MOUNTAIN", "SOGEN", "UMI", "YAMI"

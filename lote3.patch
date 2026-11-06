@@ -1,0 +1,779 @@
+diff -u -r -N include.l2/DuelEngine.h include/DuelEngine.h
+--- include.l2/DuelEngine.h	2026-10-22 16:53:32.697955998 +0000
++++ include/DuelEngine.h	2026-10-22 22:42:50.175993465 +0000
+@@ -156,6 +156,15 @@
+ */
+ bool DuelEngine_GuardianStarBeats(int star, int otherStar);
+ 
++/* Nome em maiusculas ("MARS".."VENUS"); "" se a estrela for invalida. */
++const char* DuelEngine_GuardianStarName(int star);
++
++/*
++    Compara a estrela com os monstros VISIVEIS (virados para cima) do
++    oponente: wins = quantos ela vence, losses = contra quantos perde.
++*/
++void DuelEngine_CountStarMatchups(int star, int* wins, int* losses);
++
+ /*
+     Define a estrela do monstro do jogador no slot.
+     choice: 0 = primeira estrela da carta, 1 = segunda.
+diff -u -r -N include.l2/duel/DuelFieldMode.h include/duel/DuelFieldMode.h
+--- include.l2/duel/DuelFieldMode.h	2026-10-22 16:53:32.697341034 +0000
++++ include/duel/DuelFieldMode.h	2026-10-22 22:42:50.176768225 +0000
+@@ -1,6 +1,7 @@
+ ﻿#pragma once
+ 
+ #include "DuelEngine.h"
++#include "GameData.h"
+ 
+ #include "duel/DuelDeck.h"
+ #include "duel/DuelField.h"
+@@ -32,6 +33,14 @@
+     */
+     bool synchronizeHandFromEngine();
+ 
++    /* Lote 3: escolha de estrela guardia e menu de duelistas */
++    const CardData* summonCandidateCard();
++    bool toggleGuardianStarChoice();
++    bool processDuelistMenuInput(
++        std::uint32_t pressed
++    );
++    void startDuelWithSelectedDuelist();
++
+     bool beginNextTurn();
+ 
+     bool moveHandSelectionLeft();
+@@ -162,6 +171,10 @@
+     bool summonSelectionActive_ = false;
+     bool summonTargetConfirmed_ = false;
+     bool cardPlayedThisTurn_ = false;
++    bool duelistMenuActive_ = false;
++    int duelistMenuIndex_ = 0;
++    int opponentDuelistIndex_ = 0;
++    int selectedGuardianChoice_ = 0;
+     bool initialized_ = false;
+ };
+ 
+diff -u -r -N include.l2/duel/DuelOverlays.h include/duel/DuelOverlays.h
+--- include.l2/duel/DuelOverlays.h	1970-01-01 00:00:00.000000000 +0000
++++ include/duel/DuelOverlays.h	2026-10-22 22:42:24.892867499 +0000
+@@ -0,0 +1,18 @@
++#pragma once
++
++#include "GameData.h"
++
++namespace YGOFM {
++
++/*
++    Painel da escolha de estrela guardia ao invocar: mostra as duas estrelas
++    da carta (a escolhida marcada com '>') e "VS +n -m": quantos monstros
++    visiveis do oponente a estrela escolhida vence (+) e perde contra (-).
++    choice: 0 = primeira estrela, 1 = segunda.
++*/
++void DuelOverlay_DrawStarChooser(const CardData* card, int choice);
++
++/* Tela cheia de selecao do duelista adversario. */
++void DuelOverlay_DrawDuelistMenu(int selectedIndex);
++
++}
+diff -u -r -N include.l2/duel/ListMenu.h include/duel/ListMenu.h
+--- include.l2/duel/ListMenu.h	1970-01-01 00:00:00.000000000 +0000
++++ include/duel/ListMenu.h	2026-10-22 22:42:24.892164057 +0000
+@@ -0,0 +1,60 @@
++#pragma once
++
++namespace YGOFM {
++
++/* Navegacao de lista pura (sem DS), testada no PC. */
++
++/* Passo de 1 com volta ao outro extremo. */
++inline int ListMenu_Step(int index, int delta, int count) {
++    if (count <= 0) {
++        return 0;
++    }
++
++    int next = (index + delta) % count;
++
++    if (next < 0) {
++        next += count;
++    }
++
++    return next;
++}
++
++/* Salto de pagina sem volta (para nos extremos). */
++inline int ListMenu_Page(int index, int delta, int count) {
++    if (count <= 0) {
++        return 0;
++    }
++
++    int next = index + delta;
++
++    if (next < 0) {
++        next = 0;
++    }
++
++    if (next > count - 1) {
++        next = count - 1;
++    }
++
++    return next;
++}
++
++/* Primeira linha visivel: mantem o item selecionado dentro da janela. */
++inline int ListMenu_WindowStart(int index, int count, int rows) {
++    if (count <= rows) {
++        return 0;
++    }
++
++    int start = index - rows / 2;
++
++    if (start < 0) {
++        start = 0;
++    }
++
++    if (start > count - rows) {
++        start = count - rows;
++    }
++
++    return start;
++}
++
++}
+diff -u -r -N include.l2/duel/PixelFont.h include/duel/PixelFont.h
+--- include.l2/duel/PixelFont.h	1970-01-01 00:00:00.000000000 +0000
++++ include/duel/PixelFont.h	2026-10-22 22:42:24.888467736 +0000
+@@ -0,0 +1,15 @@
++#pragma once
++
++namespace YGOFM {
++
++constexpr int kPixelFontGlyphWidth = 3;
++constexpr int kPixelFontGlyphHeight = 5;
++
++/*
++    Fonte 3x5 (A-Z, 0-9, espaco e alguns simbolos). Devolve 15 caracteres
++    '0'/'1' (linha a linha). Minusculas usam o glifo da maiuscula; caractere
++    desconhecido devolve glifo em branco. Sem dependencia do DS (testavel no PC).
++*/
++const char* PixelFont_Glyph(char character);
++
++}
+diff -u -r -N include.l2/duel/PixelText.h include/duel/PixelText.h
+--- include.l2/duel/PixelText.h	1970-01-01 00:00:00.000000000 +0000
++++ include/duel/PixelText.h	2026-10-22 22:42:24.890158484 +0000
+@@ -0,0 +1,14 @@
++#pragma once
++
++#include <nds.h>
++
++namespace YGOFM {
++
++/* Desenho direto no fundo bitmap 256x192 da tela de cima (mesmo buffer do LP). */
++u16 PixelText_Color(int red, int green, int blue);
++void PixelText_Fill(int x, int y, int width, int height, u16 color);
++void PixelText_Frame(int x, int y, int width, int height, u16 color);
++void PixelText_Draw(int x, int y, const char* text, u16 color, int scale = 2);
++int PixelText_Width(const char* text, int scale = 2);
++
++}
+diff -u -r -N source.l2/DuelEngine.cpp source/DuelEngine.cpp
+--- source.l2/DuelEngine.cpp	2026-10-22 16:53:32.694985390 +0000
++++ source/DuelEngine.cpp	2026-10-22 22:42:50.176297164 +0000
+@@ -1037,3 +1037,44 @@
+ 
+     return -1;
+ }
++
++
++const char* DuelEngine_GuardianStarName(int star) {
++    static const char* const names[] = {
++        "", "MARS", "JUPITER", "SATURN", "URANUS", "PLUTO", "NEPTUNE",
++        "MERCURY", "SUN", "MOON", "VENUS"
++    };
++
++    if (star < 1 || star > 10) {
++        return "";
++    }
++
++    return names[star];
++}
++
++void DuelEngine_CountStarMatchups(int star, int* wins, int* losses) {
++    int winCount = 0;
++    int lossCount = 0;
++
++    for (int i = 0; i < DUEL_FIELD_SIZE; i++) {
++        const DuelFieldCard& other = duel.opponent.field[i];
++
++        if (other.cardId == 0 || !other.faceUp) {
++            continue;
++        }
++
++        if (DuelEngine_GuardianStarBeats(star, other.guardianStar)) {
++            winCount++;
++        } else if (DuelEngine_GuardianStarBeats(other.guardianStar, star)) {
++            lossCount++;
++        }
++    }
++
++    if (wins != nullptr) {
++        *wins = winCount;
++    }
++
++    if (losses != nullptr) {
++        *losses = lossCount;
++    }
++}
+diff -u -r -N source.l2/duel/DuelFieldMode.cpp source/duel/DuelFieldMode.cpp
+--- source.l2/duel/DuelFieldMode.cpp	2026-10-22 16:53:32.694304414 +0000
++++ source/duel/DuelFieldMode.cpp	2026-10-22 22:42:50.179128203 +0000
+@@ -1,5 +1,7 @@
+ ﻿#include "duel/DuelFieldMode.h"
+ #include "duel/DuelLifePointRenderer.h"
++#include "duel/DuelOverlays.h"
++#include "duel/ListMenu.h"
+ 
+ #include "DuelEngine.h"
+ #include "GameData.h"
+@@ -17,8 +19,8 @@
+ namespace {
+     constexpr std::uint16_t kFirstTestCardIndex = 0;
+ 
+-    /* indice do duelista adversario em GameData (provisorio: sem menu ainda) */
+-    constexpr int kOpponentDuelistIndex = 0;
++    /* salto de L/R no menu de duelistas */
++    constexpr int kDuelistMenuPageSize = 8;
+ 
+     constexpr int kMonsterZoneCount = 5;
+ 
+@@ -100,6 +102,9 @@
+ 
+     initialized_ = true;
+ 
++    /* o jogo abre no menu de duelistas */
++    duelistMenuActive_ = true;
++
+     redraw();
+ 
+     return true;
+@@ -131,7 +136,7 @@
+ 
+     const DuelistData* opponent =
+         GameData_GetDuelistByIndex(
+-            kOpponentDuelistIndex
++            opponentDuelistIndex_
+         );
+ 
+     if (opponent == nullptr) {
+@@ -437,6 +442,12 @@
+ 
+     cardPlayedThisTurn_ = true;
+ 
++    /* estrela escolhida pelo jogador (0 = primeira, 1 = segunda) */
++    DuelEngine_SetGuardianStar(
++        selectedSummonSlot_,
++        selectedGuardianChoice_
++    );
++
+     synchronizeMonsterFieldsFromEngine();
+     synchronizeHandFromEngine();
+ 
+@@ -485,6 +496,103 @@
+     return true;
+ }
+ 
++const CardData* DuelFieldMode::summonCandidateCard() {
++    if (selectedHandPosition_ >= playerHand_.size()) {
++        return nullptr;
++    }
++
++    /* DuelField usa indices 0-721; GameData usa IDs 1-722 */
++    return GameData_GetCardById(
++        playerHand_.cardAt(
++            selectedHandPosition_
++        ) + 1
++    );
++}
++
++bool DuelFieldMode::toggleGuardianStarChoice() {
++    const CardData* card =
++        summonCandidateCard();
++
++    if (
++        card == nullptr ||
++        card->guardian2 == 0 ||
++        card->guardian2 == card->guardian1
++    ) {
++        return false;
++    }
++
++    selectedGuardianChoice_ =
++        selectedGuardianChoice_ == 0
++            ? 1
++            : 0;
++
++    return true;
++}
++
++bool DuelFieldMode::processDuelistMenuInput(
++    std::uint32_t pressed
++) {
++    const int count =
++        GameData_GetDuelistCount();
++
++    if (count <= 0) {
++        return false;
++    }
++
++    bool changed = false;
++
++    if (pressed & KEY_UP) {
++        duelistMenuIndex_ =
++            ListMenu_Step(duelistMenuIndex_, -1, count);
++        changed = true;
++    }
++
++    if (pressed & KEY_DOWN) {
++        duelistMenuIndex_ =
++            ListMenu_Step(duelistMenuIndex_, 1, count);
++        changed = true;
++    }
++
++    if (pressed & KEY_L) {
++        duelistMenuIndex_ =
++            ListMenu_Page(
++                duelistMenuIndex_,
++                -kDuelistMenuPageSize,
++                count
++            );
++        changed = true;
++    }
++
++    if (pressed & KEY_R) {
++        duelistMenuIndex_ =
++            ListMenu_Page(
++                duelistMenuIndex_,
++                kDuelistMenuPageSize,
++                count
++            );
++        changed = true;
++    }
++
++    if (pressed & (KEY_A | KEY_START)) {
++        startDuelWithSelectedDuelist();
++        changed = true;
++    }
++
++    return changed;
++}
++
++void DuelFieldMode::startDuelWithSelectedDuelist() {
++    opponentDuelistIndex_ =
++        duelistMenuIndex_;
++
++    duelistMenuActive_ = false;
++
++    /* o menu limpou a tela inteira: restaura o fundo do campo */
++    Graphics_DrawTopBackground();
++
++    resetDuel();
++}
++
+ bool DuelFieldMode::selectFirstAvailableMonsterZone() {
+     for (
+         int slot = 0;
+@@ -608,6 +716,7 @@
+     cardConfirmed_ = false;
+     summonSelectionActive_ = false;
+     summonTargetConfirmed_ = false;
++    selectedGuardianChoice_ = 0;
+ }
+ 
+ FieldZone* DuelFieldMode::playerMonsterZone(
+@@ -1343,6 +1452,14 @@
+ ) {
+     bool changed = false;
+ 
++    if (duelistMenuActive_) {
++        if (processDuelistMenuInput(pressed)) {
++            redraw();
++        }
++
++        return;
++    }
++
+     if (attackSelectionActive_) {
+         if (pressed & KEY_LEFT) {
+             changed =
+@@ -1493,14 +1610,33 @@
+         }
+     }
+ 
+-    if (pressed & KEY_START) {
++    /* UP/DOWN troca a estrela guardia da carta que esta sendo invocada */
++    if (
++        summonSelectionActive_ &&
++        (pressed & (KEY_UP | KEY_DOWN))
++    ) {
+         changed =
+-            beginNextTurn() ||
++            toggleGuardianStarChoice() ||
+             changed;
+     }
+ 
++    if (pressed & KEY_START) {
++        if (isDuelFinished()) {
++            /* duelo acabado: START abre o menu para jogar de novo */
++            duelistMenuIndex_ = opponentDuelistIndex_;
++            duelistMenuActive_ = true;
++            changed = true;
++        } else {
++            changed =
++                beginNextTurn() ||
++                changed;
++        }
++    }
++
+     if (pressed & KEY_SELECT) {
+-        resetDuel();
++        /* abre o menu ja no duelista atual (A = revanche) */
++        duelistMenuIndex_ = opponentDuelistIndex_;
++        duelistMenuActive_ = true;
+         changed = true;
+     }
+ 
+@@ -1510,6 +1646,16 @@
+ }
+ 
+ void DuelFieldMode::redraw() {
++    if (duelistMenuActive_) {
++        DuelOverlay_DrawDuelistMenu(
++            duelistMenuIndex_
++        );
++
++        bgUpdate();
++
++        return;
++    }
++
+     renderer_.draw(field_);
+ 
+     /*
+@@ -1556,6 +1702,14 @@
+         e selecoes para permanecer visivel.
+     */
+     DuelLifePointRenderer_Draw();
++
++    /* painel de estrelas por cima de tudo durante a invocacao */
++    if (summonSelectionActive_) {
++        DuelOverlay_DrawStarChooser(
++            summonCandidateCard(),
++            selectedGuardianChoice_
++        );
++    }
+ bgUpdate();
+ }
+ 
+diff -u -r -N source.l2/duel/DuelOverlays.cpp source/duel/DuelOverlays.cpp
+--- source.l2/duel/DuelOverlays.cpp	1970-01-01 00:00:00.000000000 +0000
++++ source/duel/DuelOverlays.cpp	2026-10-22 22:42:24.893574217 +0000
+@@ -0,0 +1,133 @@
++#include "duel/DuelOverlays.h"
++#include "duel/ListMenu.h"
++#include "duel/PixelText.h"
++
++#include "DuelEngine.h"
++#include "GameData.h"
++#include "graphics/GraphicsEngine.h"
++
++#include <cstdio>
++
++namespace YGOFM {
++namespace {
++
++/* Posicao do painel de estrelas (canto superior direito). Ajuste se
++   sobrepor algo importante na sua tela. */
++constexpr int kStarPanelX = 152;
++constexpr int kStarPanelY = 4;
++constexpr int kStarPanelWidth = 100;
++constexpr int kStarPanelHeight = 42;
++
++constexpr int kMenuListY = 26;
++constexpr int kMenuRowHeight = 12;
++constexpr int kMenuVisibleRows = 12;
++
++}
++
++void DuelOverlay_DrawStarChooser(const CardData* card, int choice) {
++    if (card == nullptr || card->guardian1 == 0) {
++        return;
++    }
++
++    const int first = card->guardian1;
++    const int second = card->guardian2;
++    const bool hasChoice = second != 0 && second != first;
++    const int chosenStar = (choice == 1 && hasChoice) ? second : first;
++
++    const u16 panelColor = PixelText_Color(2, 3, 8);
++    const u16 frameColor = PixelText_Color(28, 22, 6);
++    const u16 textColor = PixelText_Color(31, 31, 31);
++
++    PixelText_Fill(
++        kStarPanelX, kStarPanelY,
++        kStarPanelWidth, kStarPanelHeight,
++        panelColor
++    );
++    PixelText_Frame(
++        kStarPanelX, kStarPanelY,
++        kStarPanelWidth, kStarPanelHeight,
++        frameColor
++    );
++
++    char line[24];
++    int y = kStarPanelY + 3;
++
++    std::snprintf(
++        line, sizeof(line), "%c %s",
++        chosenStar == first ? '>' : ' ',
++        DuelEngine_GuardianStarName(first)
++    );
++    PixelText_Draw(kStarPanelX + 4, y, line, textColor);
++    y += 12;
++
++    if (hasChoice) {
++        std::snprintf(
++            line, sizeof(line), "%c %s",
++            chosenStar == second ? '>' : ' ',
++            DuelEngine_GuardianStarName(second)
++        );
++        PixelText_Draw(kStarPanelX + 4, y, line, textColor);
++        y += 12;
++    }
++
++    int wins = 0;
++    int losses = 0;
++
++    DuelEngine_CountStarMatchups(chosenStar, &wins, &losses);
++
++    std::snprintf(line, sizeof(line), "VS +%d -%d", wins, losses);
++    PixelText_Draw(kStarPanelX + 4, y, line, textColor);
++}
++
++void DuelOverlay_DrawDuelistMenu(int selectedIndex) {
++    const int count = GameData_GetDuelistCount();
++
++    Graphics_ClearTop(PixelText_Color(2, 2, 8));
++
++    const u16 titleColor = PixelText_Color(31, 24, 4);
++    const u16 textColor = PixelText_Color(31, 31, 31);
++    const u16 highlight = PixelText_Color(6, 8, 18);
++
++    PixelText_Draw(8, 6, "SELECT OPPONENT", titleColor);
++
++    char line[40];
++
++    std::snprintf(
++        line, sizeof(line), "%02d/%02d", selectedIndex + 1, count
++    );
++    PixelText_Draw(256 - 8 - PixelText_Width(line), 6, line, titleColor);
++
++    const int start =
++        ListMenu_WindowStart(selectedIndex, count, kMenuVisibleRows);
++
++    for (int row = 0; row < kMenuVisibleRows; row++) {
++        const int index = start + row;
++
++        if (index >= count) {
++            break;
++        }
++
++        const DuelistData* duelist = GameData_GetDuelistByIndex(index);
++
++        if (duelist == nullptr) {
++            continue;
++        }
++
++        const int y = kMenuListY + row * kMenuRowHeight;
++
++        if (index == selectedIndex) {
++            PixelText_Fill(4, y - 1, 248, kMenuRowHeight, highlight);
++        }
++
++        std::snprintf(
++            line, sizeof(line), "%c %s",
++            index == selectedIndex ? '>' : ' ',
++            duelist->name
++        );
++        PixelText_Draw(8, y + 1, line, textColor);
++    }
++
++    PixelText_Draw(8, 178, "A:START  L R:PAGE", titleColor);
++}
++
++}
+diff -u -r -N source.l2/duel/PixelFont.cpp source/duel/PixelFont.cpp
+--- source.l2/duel/PixelFont.cpp	1970-01-01 00:00:00.000000000 +0000
++++ source/duel/PixelFont.cpp	2026-10-22 22:43:55.622910486 +0000
+@@ -0,0 +1,57 @@
++#include "duel/PixelFont.h"
++
++namespace YGOFM {
++namespace {
++
++struct GlyphEntry {
++    char character;
++    const char* rows;
++};
++
++const char kBlankGlyph[] = "000000000000000";
++
++const GlyphEntry kGlyphs[] = {
++    {'A', "010101111101101"}, {'B', "110101110101110"},
++    {'C', "011100100100011"}, {'D', "110101101101110"},
++    {'E', "111100110100111"}, {'F', "111100110100100"},
++    {'G', "011100101101011"}, {'H', "101101111101101"},
++    {'I', "111010010010111"}, {'J', "001001001101010"},
++    {'K', "101101110101101"}, {'L', "100100100100111"},
++    {'M', "111111101101101"}, {'N', "111101101101101"},
++    {'O', "010101101101010"}, {'P', "110101110100100"},
++    {'Q', "010101101110011"}, {'R', "110101110101101"},
++    {'S', "011100010001110"}, {'T', "111010010010010"},
++    {'U', "101101101101111"}, {'V', "101101101101010"},
++    {'W', "101101101111111"}, {'X', "101101010101101"},
++    {'Y', "101101010010010"}, {'Z', "111001010100111"},
++    {'0', "111101101101111"}, {'1', "010110010010111"},
++    {'2', "111001111100111"}, {'3', "111001111001111"},
++    {'4', "101101111001001"}, {'5', "111100111001111"},
++    {'6', "111100111101111"}, {'7', "111001010010010"},
++    {'8', "111101111101111"}, {'9', "111101111001111"},
++    {' ', "000000000000000"}, {'-', "000000111000000"},
++    {':', "000010000010000"}, {'.', "000000000000010"},
++    {'>', "100010001010100"}, {'/', "001001010100100"},
++    {'+', "000010111010000"},
++};
++
++constexpr int kGlyphCount =
++    static_cast<int>(sizeof(kGlyphs) / sizeof(kGlyphs[0]));
++
++}
++
++const char* PixelFont_Glyph(char character) {
++    if (character >= 'a' && character <= 'z') {
++        character = static_cast<char>(character - 'a' + 'A');
++    }
++
++    for (int i = 0; i < kGlyphCount; i++) {
++        if (kGlyphs[i].character == character) {
++            return kGlyphs[i].rows;
++        }
++    }
++
++    return kBlankGlyph;
++}
++
++}
+diff -u -r -N source.l2/duel/PixelText.cpp source/duel/PixelText.cpp
+--- source.l2/duel/PixelText.cpp	1970-01-01 00:00:00.000000000 +0000
++++ source/duel/PixelText.cpp	2026-10-22 22:42:24.891333157 +0000
+@@ -0,0 +1,100 @@
++#include "duel/PixelText.h"
++#include "duel/PixelFont.h"
++
++namespace YGOFM {
++namespace {
++
++constexpr int kScreenWidth = 256;
++constexpr int kScreenHeight = 192;
++constexpr int kGlyphSpacing = 1;
++
++u16* pixels() {
++    return reinterpret_cast<u16*>(
++        BG_BMP_RAM(0)
++    );
++}
++
++void putPixel(int x, int y, u16 color) {
++    u16* destination = pixels();
++
++    if (
++        destination == nullptr ||
++        x < 0 ||
++        y < 0 ||
++        x >= kScreenWidth ||
++        y >= kScreenHeight
++    ) {
++        return;
++    }
++
++    destination[y * kScreenWidth + x] = color;
++}
++
++}
++
++u16 PixelText_Color(int red, int green, int blue) {
++    return static_cast<u16>(
++        RGB15(red, green, blue) | BIT(15)
++    );
++}
++
++void PixelText_Fill(int x, int y, int width, int height, u16 color) {
++    for (int row = 0; row < height; row++) {
++        for (int column = 0; column < width; column++) {
++            putPixel(x + column, y + row, color);
++        }
++    }
++}
++
++void PixelText_Frame(int x, int y, int width, int height, u16 color) {
++    PixelText_Fill(x, y, width, 1, color);
++    PixelText_Fill(x, y + height - 1, width, 1, color);
++    PixelText_Fill(x, y, 1, height, color);
++    PixelText_Fill(x + width - 1, y, 1, height, color);
++}
++
++int PixelText_Width(const char* text, int scale) {
++    if (text == nullptr) {
++        return 0;
++    }
++
++    int length = 0;
++
++    while (text[length] != '\0') {
++        length++;
++    }
++
++    return length * (kPixelFontGlyphWidth + kGlyphSpacing) * scale;
++}
++
++void PixelText_Draw(int x, int y, const char* text, u16 color, int scale) {
++    if (text == nullptr || scale < 1) {
++        return;
++    }
++
++    int currentX = x;
++
++    for (int index = 0; text[index] != '\0'; index++) {
++        const char* glyph = PixelFont_Glyph(text[index]);
++
++        for (int row = 0; row < kPixelFontGlyphHeight; row++) {
++            for (int column = 0; column < kPixelFontGlyphWidth; column++) {
++                if (glyph[row * kPixelFontGlyphWidth + column] != '1') {
++                    continue;
++                }
++
++                PixelText_Fill(
++                    currentX + column * scale,
++                    y + row * scale,
++                    scale,
++                    scale,
++                    color
++                );
++            }
++        }
++
++        currentX += (kPixelFontGlyphWidth + kGlyphSpacing) * scale;
++    }
++}
++
++}

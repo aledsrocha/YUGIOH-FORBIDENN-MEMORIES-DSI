@@ -1,0 +1,217 @@
+diff -u -r -N include.l8/duel/DuelFieldMode.h include/duel/DuelFieldMode.h
+--- include.l8/duel/DuelFieldMode.h	2026-10-24 21:29:32.601792774 +0000
++++ include/duel/DuelFieldMode.h	2026-10-24 21:29:55.829096130 +0000
+@@ -49,6 +49,7 @@
+     bool commitChainSummon();
+     bool playMagicFromHand();
+     bool playRitualFromHand();
++    bool showCardMessage(const char* message);
+     bool beginEquipSelection();
+     int findEquipTarget(int start, int direction);
+     bool moveEquipTarget(int direction);
+@@ -197,6 +198,8 @@
+     int equipTargetSlot_ = -1;
+     int deckKind_ = 0; /* 0 = basico, 1 = teste */
+     bool bannerActive_ = false;
++    bool bannerIsMessage_ = false;
++    char bannerMessage_[24] = {0};
+     int bannerCardId_ = 0;
+     DuelSpellOutcome bannerOutcome_ = {0, 0, 0, 0};
+     bool initialized_ = false;
+diff -u -r -N include.l8/duel/DuelOverlays.h include/duel/DuelOverlays.h
+--- include.l8/duel/DuelOverlays.h	2026-10-24 21:29:32.602001646 +0000
++++ include/duel/DuelOverlays.h	2026-10-24 21:29:55.828138281 +0000
+@@ -24,6 +24,9 @@
+ /* Aviso no meio da tela com o resultado de uma magia recem-jogada. */
+ void DuelOverlay_DrawSpellBanner(int cardId, const DuelSpellOutcome& outcome);
+ 
++/* Aviso curto (ate 21 letras) sobre uma carta que nao pode ser jogada agora. */
++void DuelOverlay_DrawMessageBanner(int cardId, const char* message);
++
+ /* Selos de Swords of Revealing Light (quem esta impedido de atacar e por quantos turnos). */
+ void DuelOverlay_DrawSwordsBadges();
+ 
+diff -u -r -N source.l8/EquipEngine.cpp source/EquipEngine.cpp
+--- source.l8/EquipEngine.cpp	2026-10-24 21:29:32.600344794 +0000
++++ source/EquipEngine.cpp	2026-10-24 21:29:55.827801618 +0000
+@@ -19,6 +19,9 @@
+ static int equipCount = 0;
+ 
+ bool EquipEngine_Load() {
++    /* recarregar nao pode acumular nem deixar dados antigos */
++    equipCount = 0;
++
+     FILE* fp = fopen(GAMEDATA_ROOT "equips.dat", "rb");
+ 
+     if (!fp) {
+diff -u -r -N source.l8/GameData.cpp source/GameData.cpp
+--- source.l8/GameData.cpp	2026-10-24 21:29:32.600363881 +0000
++++ source/GameData.cpp	2026-10-24 21:29:55.827356573 +0000
+@@ -1,4 +1,5 @@
+ #include "GameData.h"
++#include "EquipEngine.h"
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -83,7 +84,17 @@
+ }
+ 
+ bool GameData_LoadAll() {
+-    return LoadCards() && LoadFusions() && LoadDuelists() && LoadEquipsCount();
++    /*
++        EquipEngine_Load() tambem precisa rodar aqui: sem ele a lista de
++        compatibilidade de equips fica vazia e nenhum equip serve em nenhum monstro
++        (nem na jogada direta, nem dentro de uma cadeia de fusao).
++    */
++    return
++        LoadCards() &&
++        LoadFusions() &&
++        LoadDuelists() &&
++        LoadEquipsCount() &&
++        EquipEngine_Load();
+ }
+ 
+ int GameData_GetCardCount() { return cardCount; }
+diff -u -r -N source.l8/duel/DuelFieldMode.cpp source/duel/DuelFieldMode.cpp
+--- source.l8/duel/DuelFieldMode.cpp	2026-10-24 21:29:32.600093409 +0000
++++ source/duel/DuelFieldMode.cpp	2026-10-24 21:29:55.831182557 +0000
+@@ -679,6 +679,14 @@
+ 
+ bool DuelFieldMode::beginPlaySelection() {
+     if (
++        !isDuelFinished() &&
++        cardPlayedThisTurn_ &&
++        !summonSelectionActive_
++    ) {
++        return showCardMessage("ALREADY PLAYED A CARD");
++    }
++
++    if (
+         isDuelFinished() ||
+         cardPlayedThisTurn_ ||
+         summonSelectionActive_ ||
+@@ -717,9 +725,13 @@
+     }
+     /* equip: escolhe o monstro em campo que vai recebe-lo */
+     if (card->type == 23) {
+-        return beginEquipSelection();
+-    }
++        if (beginEquipSelection()) {
++            return true;
++        }
+ 
++        /* nenhum monstro seu em campo aceita este equip */
++        return showCardMessage("NO MONSTER CAN USE IT");
++    }
+     return beginSummonSelection();
+ }
+ 
+@@ -898,6 +910,7 @@
+ 
+     /* aviso com o resultado, ate a proxima tecla */
+     bannerActive_ = true;
++    bannerIsMessage_ = false;
+     bannerCardId_ = cardId;
+     bannerOutcome_ = outcome;
+ 
+@@ -907,6 +920,38 @@
+     return true;
+ }
+ 
++bool DuelFieldMode::showCardMessage(const char* message) {
++    if (selectedHandPosition_ >= playerHand_.size()) {
++        return false;
++    }
++
++    const CardData* card =
++        GameData_GetCardByIndex(
++            static_cast<int>(
++                playerHand_.cardAt(
++                    selectedHandPosition_
++                )
++            )
++        );
++
++    if (card == nullptr) {
++        return false;
++    }
++
++    std::snprintf(
++        bannerMessage_,
++        sizeof(bannerMessage_),
++        "%s",
++        message
++    );
++
++    bannerActive_ = true;
++    bannerIsMessage_ = true;
++    bannerCardId_ = card->id;
++
++    return true;
++}
++
+ bool DuelFieldMode::playRitualFromHand() {
+     const int slot =
+         DuelEngine_FindPlayerHandSlotByOrder(
+@@ -943,6 +988,7 @@
+ 
+     /* sem os 3 tributos so avisa: a carta fica na mao e a jogada nao e gasta */
+     bannerActive_ = true;
++    bannerIsMessage_ = false;
+     bannerCardId_ = cardId;
+     bannerOutcome_ = outcome;
+ 
+@@ -2309,10 +2355,17 @@
+     DuelOverlay_DrawSwordsBadges();
+ 
+     if (bannerActive_) {
+-        DuelOverlay_DrawSpellBanner(
+-            bannerCardId_,
+-            bannerOutcome_
+-        );
++        if (bannerIsMessage_) {
++            DuelOverlay_DrawMessageBanner(
++                bannerCardId_,
++                bannerMessage_
++            );
++        } else {
++            DuelOverlay_DrawSpellBanner(
++                bannerCardId_,
++                bannerOutcome_
++            );
++        }
+     }
+ bgUpdate();
+ }
+diff -u -r -N source.l8/duel/DuelOverlays.cpp source/duel/DuelOverlays.cpp
+--- source.l8/duel/DuelOverlays.cpp	2026-10-24 21:29:32.600305181 +0000
++++ source/duel/DuelOverlays.cpp	2026-10-24 21:29:55.828571769 +0000
+@@ -211,6 +211,28 @@
+     PixelText_Draw(x + 4, y + 17, message, PixelText_Color(31, 31, 31));
+ }
+ 
++void DuelOverlay_DrawMessageBanner(int cardId, const char* message) {
++    const CardData* card = GameData_GetCardById(cardId);
++
++    if (card == nullptr || message == nullptr) {
++        return;
++    }
++
++    constexpr int x = 40;
++    constexpr int y = 80;
++    constexpr int width = 176;
++    constexpr int height = 32;
++
++    PixelText_Fill(x, y, width, height, PixelText_Color(2, 3, 8));
++    PixelText_Frame(x, y, width, height, PixelText_Color(31, 10, 8));
++
++    char name[24];
++
++    copyName(name, sizeof(name), card->name, 21);
++    PixelText_Draw(x + 4, y + 4, name, PixelText_Color(18, 31, 20));
++    PixelText_Draw(x + 4, y + 17, message, PixelText_Color(31, 14, 10));
++}
++
+ void DuelOverlay_DrawSwordsBadges() {
+     char text[16];
+ 

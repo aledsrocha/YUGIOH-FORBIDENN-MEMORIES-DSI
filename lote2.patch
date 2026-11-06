@@ -1,0 +1,604 @@
+diff -u -r include.l1/DuelEngine.h include/DuelEngine.h
+--- include.l1/DuelEngine.h	2026-10-21 23:05:23.564824632 +0000
++++ include/DuelEngine.h	2026-10-21 23:05:54.724236695 +0000
+@@ -10,6 +10,8 @@
+ #define DUEL_START_LP 8000
+ #define DUEL_EQUIP_BONUS 500
+ #define DUEL_GUARDIAN_STAR_BONUS 500
++/* cartas com type >= 20 (Magic, Trap, Ritual, Equip) nao sao monstros */
++#define DUEL_FIRST_NON_MONSTER_TYPE 20
+ 
+ enum DuelTurn {
+     DUEL_TURN_PLAYER = 0,
+@@ -161,6 +163,27 @@
+ */
+ bool DuelEngine_SetGuardianStar(int fieldIndex, int choice);
+ 
++/*
++    Inicia um duelo em que o MOTOR e dono de deck, mao e campo.
++    playerCardIds: exatamente DUEL_DECK_SIZE ids (1..722), na ordem de
++    construcao (o motor embaralha). O deck do oponente e sorteado a
++    partir dos pesos do duelista. Ambos compram a mao inicial.
++*/
++bool DuelEngine_StartWithPlayerDeck(
++    const uint16_t* playerCardIds,
++    int cardCount,
++    const DuelistData* opponentDuelist
++);
++
++/* Semente do sorteio (decks e embaralhamento). No DS, use o RTC. */
++void DuelEngine_SeedRandom(uint32_t seed);
++
++/*
++    A interface mostra a mao sem buracos. Devolve o slot REAL da mao do
++    motor da n-esima carta presente (order = 0, 1, 2...), ou -1.
++*/
++int DuelEngine_FindPlayerHandSlotByOrder(int order);
++
+ #ifdef YGOFM_TESTING
+ /* Ganchos usados apenas pelos testes de PC (nao compilados no DS). */
+ DuelState* DuelEngine_TestGetMutableState();
+diff -u -r include.l1/duel/DuelFieldMode.h include/duel/DuelFieldMode.h
+--- include.l1/duel/DuelFieldMode.h	2026-10-21 23:05:23.564690167 +0000
++++ include/duel/DuelFieldMode.h	2026-10-21 23:05:54.725787687 +0000
+@@ -26,13 +26,11 @@
+ private:
+     bool initializeDuelCards();
+ 
+-    bool buildTestDeck();
+-
+-    bool drawInitialHand();
+-
+-    bool drawOneCard();
+-
+-    bool drawUntilHandFull();
++    /*
++        O DuelEngine e a fonte unica do estado (deck, mao, campo, turnos).
++        A mao visual e apenas um espelho dele.
++    */
++    bool synchronizeHandFromEngine();
+ 
+     bool beginNextTurn();
+ 
+@@ -134,7 +132,6 @@
+     FieldCardRenderer fieldCardRenderer_;
+     FieldCursor cursor_;
+ 
+-    DuelDeck playerDeck_;
+     PlayerHand playerHand_;
+ 
+     HandRenderer handRenderer_;
+diff -u -r source.l1/DuelEngine.cpp source/DuelEngine.cpp
+--- source.l1/DuelEngine.cpp	2026-10-21 23:05:23.563333523 +0000
++++ source/DuelEngine.cpp	2026-10-21 23:05:54.725215217 +0000
+@@ -335,7 +335,8 @@
+         const CardData* card =
+             GameData_GetCardById(cardId);
+ 
+-        if (!card) {
++        /* a CPU so invoca monstros (antes invocava Magic/Equip como monstro de 0 ATK) */
++        if (!card || card->type >= DUEL_FIRST_NON_MONSTER_TYPE) {
+             continue;
+         }
+ 
+@@ -597,6 +598,16 @@
+         return false;
+     }
+ 
++    const CardData* summonCard =
++        GameData_GetCardById(duel.player.hand.cards[handIndex]);
++
++    if (
++        summonCard == nullptr ||
++        summonCard->type >= DUEL_FIRST_NON_MONSTER_TYPE
++    ) {
++        return false;
++    }
++
+     DuelFieldCard* field =
+         &duel.player.field[fieldIndex];
+ 
+@@ -950,3 +961,79 @@
+     return BuildDeck(deck, duelist);
+ }
+ #endif
++
++
++bool DuelEngine_StartWithPlayerDeck(
++    const uint16_t* playerCardIds,
++    int cardCount,
++    const DuelistData* opponentDuelist
++) {
++    if (
++        playerCardIds == nullptr ||
++        opponentDuelist == nullptr ||
++        cardCount != DUEL_DECK_SIZE
++    ) {
++        return false;
++    }
++
++    for (int i = 0; i < cardCount; i++) {
++        if (GameData_GetCardById(playerCardIds[i]) == nullptr) {
++            return false;
++        }
++    }
++
++    memset(&duel, 0, sizeof(DuelState));
++
++    ClearPlayerState(&duel.player);
++    ClearPlayerState(&duel.opponent);
++
++    for (int i = 0; i < cardCount; i++) {
++        duel.player.deck.cards[i] = playerCardIds[i];
++    }
++
++    duel.player.deck.count = cardCount;
++    duel.player.deck.drawIndex = 0;
++
++    if (!BuildDeck(&duel.opponent.deck, opponentDuelist)) {
++        return false;
++    }
++
++    ShuffleDeck(&duel.player.deck);
++    ShuffleDeck(&duel.opponent.deck);
++
++    if (!FillHand(&duel.player) || !FillHand(&duel.opponent)) {
++        return false;
++    }
++
++    duel.turn = DUEL_TURN_PLAYER;
++    duel.finishReason = DUEL_FINISH_NONE;
++    duel.turnNumber = 1;
++    duel.finished = false;
++    duel.playerWon = false;
++
++    return true;
++}
++
++void DuelEngine_SeedRandom(uint32_t seed) {
++    srand(seed);
++}
++
++int DuelEngine_FindPlayerHandSlotByOrder(int order) {
++    if (order < 0) {
++        return -1;
++    }
++
++    int seen = 0;
++
++    for (int slot = 0; slot < DUEL_HAND_SIZE; slot++) {
++        if (duel.player.hand.cards[slot] != 0) {
++            if (seen == order) {
++                return slot;
++            }
++
++            seen++;
++        }
++    }
++
++    return -1;
++}
+diff -u -r source.l1/duel/DuelFieldMode.cpp source/duel/DuelFieldMode.cpp
+--- source.l1/duel/DuelFieldMode.cpp	2026-10-21 23:05:23.563139694 +0000
++++ source/duel/DuelFieldMode.cpp	2026-10-21 23:05:54.727152578 +0000
+@@ -10,14 +10,16 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstdio>
++#include <ctime>
+ 
+ namespace YGOFM {
+ 
+ namespace {
+-    constexpr std::size_t kInitialHandSize = 5;
+-    constexpr std::size_t kTestDeckSize = 40;
+     constexpr std::uint16_t kFirstTestCardIndex = 0;
+ 
++    /* indice do duelista adversario em GameData (provisorio: sem menu ainda) */
++    constexpr int kOpponentDuelistIndex = 0;
++
+     constexpr int kMonsterZoneCount = 5;
+ 
+     constexpr std::uint8_t kInvalidZoneIndex =
+@@ -34,6 +36,15 @@
+ 
+         consoleDemoInit();
+     }
++
++    bool isDuelFinished() {
++        const DuelState* state =
++            DuelEngine_GetState();
++
++        return
++            state == nullptr ||
++            state->finished;
++    }
+ }
+ 
+ bool DuelFieldMode::initialize() {
+@@ -95,7 +106,6 @@
+ }
+ 
+ bool DuelFieldMode::initializeDuelCards() {
+-    playerDeck_.clear();
+     playerHand_.clear();
+ 
+     selectedHandPosition_ = 0;
+@@ -106,21 +116,25 @@
+     clearAttackState();
+ 
+     /*
+-        O DuelEngine passa a manter o mesmo campo
+-        de monstros da interface visual.
+-
+-        Nesta fase, mao e deck continuam usando
+-        DuelDeck e PlayerHand.
++        O DuelEngine e o dono de deck, mao, campo e turnos.
++        Deck provisorio do jogador: cartas 1..40 (o motor embaralha).
++        O adversario usa o deck sorteado a partir do duelista real.
+     */
+-    if (!DuelEngine_StartExternalField()) {
+-        return false;
+-    }
++    std::uint16_t testDeck[DUEL_DECK_SIZE];
+ 
+-    if (!synchronizeMonsterFieldsFromEngine()) {
+-        return false;
++    for (int i = 0; i < DUEL_DECK_SIZE; i++) {
++        testDeck[i] =
++            static_cast<std::uint16_t>(
++                kFirstTestCardIndex + i + 1
++            );
+     }
+ 
+-    if (!buildTestDeck()) {
++    const DuelistData* opponent =
++        GameData_GetDuelistByIndex(
++            kOpponentDuelistIndex
++        );
++
++    if (opponent == nullptr) {
+         return false;
+     }
+ 
+@@ -132,98 +146,26 @@
+         1664525U +
+         1013904223U;
+ 
+-    if (!playerDeck_.shuffle(
+-        shuffleSeed
+-    )) {
+-        return false;
+-    }
+-
+-    return drawInitialHand();
+-}
++    DuelEngine_SeedRandom(
++        shuffleSeed ^
++        static_cast<std::uint32_t>(
++            std::time(nullptr)
++        )
++    );
+ 
+-bool DuelFieldMode::buildTestDeck() {
+-    if (!playerDeck_.buildSequential(
+-        kFirstTestCardIndex,
+-        kTestDeckSize
++    if (!DuelEngine_StartWithPlayerDeck(
++        testDeck,
++        DUEL_DECK_SIZE,
++        opponent
+     )) {
+         return false;
+     }
+ 
+-    for (
+-        std::size_t position = 0;
+-        position < playerDeck_.size();
+-        position++
+-    ) {
+-        const std::uint16_t cardIndex =
+-            playerDeck_.cardAt(position);
+-
+-        if (
+-            cardIndex ==
+-                DuelDeck::kInvalidCard ||
+-            GameData_GetCardByIndex(
+-                static_cast<int>(
+-                    cardIndex
+-                )
+-            ) == nullptr
+-        ) {
+-            return false;
+-        }
+-    }
+-
+-    return true;
+-}
+-
+-bool DuelFieldMode::drawInitialHand() {
+-    for (
+-        std::size_t draw = 0;
+-        draw < kInitialHandSize;
+-        draw++
+-    ) {
+-        if (!drawOneCard()) {
+-            return false;
+-        }
+-    }
+-
+-    return
+-        playerHand_.size() ==
+-        kInitialHandSize;
+-}
+-
+-bool DuelFieldMode::drawOneCard() {
+-    if (
+-        playerDeck_.isEmpty() ||
+-        playerHand_.isFull()
+-    ) {
+-        return false;
+-    }
+-
+-    std::uint16_t cardIndex =
+-        DuelDeck::kInvalidCard;
+-
+-    if (!playerDeck_.drawCard(
+-        cardIndex
+-    )) {
++    if (!synchronizeMonsterFieldsFromEngine()) {
+         return false;
+     }
+ 
+-    return playerHand_.addCard(
+-        cardIndex
+-    );
+-}
+-
+-bool DuelFieldMode::drawUntilHandFull() {
+-    while (
+-        !playerHand_.isFull() &&
+-        !playerDeck_.isEmpty()
+-    ) {
+-        if (!drawOneCard()) {
+-            return false;
+-        }
+-    }
+-
+-    normalizeHandSelection();
+-
+-    return true;
++    return synchronizeHandFromEngine();
+ }
+ 
+ bool DuelFieldMode::beginNextTurn() {
+@@ -235,22 +177,22 @@
+         return false;
+     }
+ 
+-    /*
+-        Primeiro completa a mÃ£o.
++    const DuelState* state =
++        DuelEngine_GetState();
+ 
+-        Se nÃ£o for possÃ­vel comprar as cartas,
+-        o novo turno nÃ£o Ã© iniciado.
+-    */
+-    if (!drawUntilHandFull()) {
++    if (
++        state == nullptr ||
++        state->finished ||
++        state->turn != DUEL_TURN_PLAYER
++    ) {
+         return false;
+     }
+ 
+     /*
+-        AvanÃ§a o turno interno do DuelEngine e
+-        redefine hasAttacked para todos os monstros
+-        do jogador.
++        O motor completa a mao do jogador, executa o turno do
++        adversario (invocar e atacar) e devolve o turno ao jogador.
+     */
+-    if (!DuelEngine_AdvanceExternalTurn()) {
++    if (!DuelEngine_EndTurn()) {
+         return false;
+     }
+ 
+@@ -259,7 +201,9 @@
+     cardPlayedThisTurn_ = false;
+ 
+     selectedHandPosition_ = 0;
+-    normalizeHandSelection();
++
++    synchronizeMonsterFieldsFromEngine();
++    synchronizeHandFromEngine();
+ 
+     return true;
+ }
+@@ -302,6 +246,7 @@
+ 
+ bool DuelFieldMode::beginSummonSelection() {
+     if (
++        isDuelFinished() ||
+         cardPlayedThisTurn_ ||
+         summonSelectionActive_ ||
+         playerHand_.isEmpty() ||
+@@ -408,6 +353,7 @@
+ 
+ bool DuelFieldMode::commitSummon() {
+     if (
++        isDuelFinished() ||
+         cardPlayedThisTurn_ ||
+         !summonSelectionActive_ ||
+         !summonTargetConfirmed_ ||
+@@ -428,6 +374,9 @@
+         !isValidSummonZone(
+             targetZone
+         ) ||
++        selectedSummonSlot_ < 0 ||
++        selectedSummonSlot_ >=
++            kMonsterZoneCount ||
+         selectedHandPosition_ >=
+             playerHand_.size() ||
+         playerHand_.cardAt(
+@@ -437,50 +386,36 @@
+         return false;
+     }
+ 
+-    if (!targetZone->placeCard(
+-        confirmedCardIndex_,
+-        true,
+-        selectedSummonPosition_
+-    )) {
+-        return false;
+-    }
+-
+-    std::uint16_t removedCardIndex =
+-        PlayerHand::kInvalidCard;
+-
+-    if (!playerHand_.removeCard(
+-        selectedHandPosition_,
+-        removedCardIndex
+-    )) {
+-        targetZone->clear();
+-
+-        return false;
+-    }
+-
+-    if (
+-        removedCardIndex !=
+-        confirmedCardIndex_
+-    ) {
+-        targetZone->clear();
+-
+-        playerHand_.insertCard(
+-            selectedHandPosition_,
+-            removedCardIndex
++    /*
++        A mao visual nao tem buracos; a do motor tem.
++        Encontra o slot real da carta escolhida.
++    */
++    const int engineHandSlot =
++        DuelEngine_FindPlayerHandSlotByOrder(
++            static_cast<int>(
++                selectedHandPosition_
++            )
+         );
+ 
++    if (engineHandSlot < 0) {
+         return false;
+     }
+ 
+     /*
+-        DuelField usa indices entre 0 e 721.
+-
+-        DuelEngine usa IDs entre 1 e 722.
+-        Portanto, o ID registrado e index + 1.
++        DuelField usa indices 0-721; DuelEngine usa IDs 1-722.
+     */
+-    const std::uint16_t engineCardId =
+-        static_cast<std::uint16_t>(
++    const DuelState* state =
++        DuelEngine_GetState();
++
++    if (
++        state == nullptr ||
++        state->player.hand.cards[
++            engineHandSlot
++        ] !=
+             confirmedCardIndex_ + 1
+-        );
++    ) {
++        return false;
++    }
+ 
+     const DuelPosition enginePosition =
+         selectedSummonPosition_ ==
+@@ -488,24 +423,22 @@
+                 ? DUEL_POSITION_DEFENSE
+                 : DUEL_POSITION_ATTACK;
+ 
+-    if (!DuelEngine_RegisterPlayerSummon(
++    /*
++        O motor decide. Se recusar, nada mudou na tela
++        e nao ha o que desfazer.
++    */
++    if (!DuelEngine_SummonFromHand(
++        engineHandSlot,
+         selectedSummonSlot_,
+-        engineCardId,
+         enginePosition
+     )) {
+-        targetZone->clear();
+-
+-        playerHand_.insertCard(
+-            selectedHandPosition_,
+-            removedCardIndex
+-        );
+-
+         return false;
+     }
+ 
+     cardPlayedThisTurn_ = true;
+ 
+-    normalizeHandSelection();
++    synchronizeMonsterFieldsFromEngine();
++    synchronizeHandFromEngine();
+ 
+     cursor_.selectZone(
+         targetZone->index()
+@@ -516,6 +449,42 @@
+     return true;
+ }
+ 
++bool DuelFieldMode::synchronizeHandFromEngine() {
++    const DuelState* state =
++        DuelEngine_GetState();
++
++    if (state == nullptr) {
++        return false;
++    }
++
++    playerHand_.clear();
++
++    for (
++        int slot = 0;
++        slot < DUEL_HAND_SIZE;
++        slot++
++    ) {
++        const std::uint16_t engineCardId =
++            state->player.hand.cards[slot];
++
++        if (engineCardId == 0) {
++            continue;
++        }
++
++        if (!playerHand_.addCard(
++            static_cast<std::uint16_t>(
++                engineCardId - 1
++            )
++        )) {
++            return false;
++        }
++    }
++
++    normalizeHandSelection();
++
++    return true;
++}
++
+ bool DuelFieldMode::selectFirstAvailableMonsterZone() {
+     for (
+         int slot = 0;
+@@ -1566,7 +1535,9 @@
+ 
+     if (!handRenderer_.draw(
+         playerHand_,
+-        playerDeck_.size(),
++        static_cast<std::size_t>(
++            DuelEngine_GetPlayerDeckRemaining()
++        ),
+         selectedHandPosition_
+     )) {
+         showError(

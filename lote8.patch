@@ -1,0 +1,659 @@
+diff -u -r -N include.l7/DuelEngine.h include/DuelEngine.h
+--- include.l7/DuelEngine.h	2026-10-24 21:14:36.481376315 +0000
++++ include/DuelEngine.h	2026-10-24 21:15:36.775170085 +0000
+@@ -39,7 +39,8 @@
+     DUEL_FINISH_NONE = 0,
+     DUEL_FINISH_LIFE_POINTS,
+     DUEL_FINISH_DECK_OUT,
+-    DUEL_FINISH_SURRENDER
++    DUEL_FINISH_SURRENDER,
++    DUEL_FINISH_EXODIA
+ };
+ 
+ struct DuelDeck {
+@@ -265,6 +266,37 @@
+ 
+ /* Turnos restantes de Swords sobre o lado (0 = livre para atacar). */
+ int DuelEngine_GetSwordsTurns(bool opponent);
++
++/*
++    Exodia: quem tiver na mao as 5 pecas (cartas 17 a 21) vence na hora, logo apos comprar
++    (regra de Duel_HasAllExodiaPieces). Termina o duelo com DUEL_FINISH_EXODIA.
++*/
++#define DUEL_EXODIA_FIRST_CARD_ID 17
++#define DUEL_EXODIA_PIECE_COUNT 5
++
++/*
++    Rituais (24 receitas, tabela do disco original): a carta de ritual da mao exige 3 monstros
++    especificos no SEU campo. Eles saem e o monstro do ritual entra no lugar do segundo,
++    virado para cima em ataque.
++*/
++#define DUEL_RITUAL_TRIBUTE_COUNT 3
++bool DuelEngine_GetRitualRecipe(int ritualCardId, int* tributes, int* resultCardId);
++bool DuelEngine_PlayRitualFromHand(int handIndex, DuelSpellOutcome* outcome);
++
++/* Como StartWithPlayerDeck; com shufflePlayerDeck = false o deck do jogador sai na ordem dada. */
++bool DuelEngine_StartWithPlayerDeckEx(
++    const uint16_t* playerCardIds,
++    int cardCount,
++    const DuelistData* opponentDuelist,
++    bool shufflePlayerDeck
++);
++
++/*
++    Deck de teste: DUEL_DECK_SIZE cartas de todos os tipos, em ordem fixa (use com
++    shufflePlayerDeck = false). Maos de 5: fusao e equip; magias; ritual Black Luster + terreno;
++    as 5 pecas do Exodia; cura, dano e Cursebreaker; ritual Ultimate Dragon; mais magias; Dark Magic Ritual.
++*/
++bool DuelEngine_BuildTestDeck(uint16_t* outCards);
+ /* Nome em maiusculas ("MARS".."VENUS"); "" se a estrela for invalida. */
+ const char* DuelEngine_GuardianStarName(int star);
+ 
+diff -u -r -N include.l7/duel/DuelFieldMode.h include/duel/DuelFieldMode.h
+--- include.l7/duel/DuelFieldMode.h	2026-10-24 21:14:36.480417615 +0000
++++ include/duel/DuelFieldMode.h	2026-10-24 21:17:12.347858977 +0000
+@@ -48,6 +48,7 @@
+     bool beginChainSummonSelection();
+     bool commitChainSummon();
+     bool playMagicFromHand();
++    bool playRitualFromHand();
+     bool beginEquipSelection();
+     int findEquipTarget(int start, int direction);
+     bool moveEquipTarget(int direction);
+@@ -194,6 +195,7 @@
+     bool equipSelectionActive_ = false;
+     int equipHandPosition_ = 0;
+     int equipTargetSlot_ = -1;
++    int deckKind_ = 0; /* 0 = basico, 1 = teste */
+     bool bannerActive_ = false;
+     int bannerCardId_ = 0;
+     DuelSpellOutcome bannerOutcome_ = {0, 0, 0, 0};
+diff -u -r -N include.l7/duel/DuelOverlays.h include/duel/DuelOverlays.h
+--- include.l7/duel/DuelOverlays.h	2026-10-24 21:14:36.481234346 +0000
++++ include/duel/DuelOverlays.h	2026-10-24 21:17:12.345869152 +0000
+@@ -30,7 +30,9 @@
+ /* Painel de equipar um monstro em campo: stats antes e depois. */
+ void DuelOverlay_DrawEquipPanel(int equipCardId, int fieldSlot);
+ 
+-/* Tela cheia de selecao do duelista adversario. */
+-void DuelOverlay_DrawDuelistMenu(int selectedIndex);
++/* Receita do ritual destacado: monstro resultante e os 3 tributos (+ no campo, - faltando). */
++void DuelOverlay_DrawRitualPanel(int ritualCardId);
+ 
++/* Tela cheia de selecao do duelista adversario. deckKind: 0 = basico, 1 = teste. */
++void DuelOverlay_DrawDuelistMenu(int selectedIndex, int deckKind);
+ }
+diff -u -r -N source.l7/DuelEngine.cpp source/DuelEngine.cpp
+--- source.l7/DuelEngine.cpp	2026-10-24 21:14:36.476615222 +0000
++++ source/DuelEngine.cpp	2026-10-24 21:15:36.777572680 +0000
+@@ -148,6 +148,49 @@
+     duel.finishReason = reason;
+ }
+ 
++/* Quem tem as 5 pecas do Exodia na mao vence (Duel_HasAllExodiaPieces do jogo). */
++static bool HasAllExodiaPieces(const DuelPlayerState* side) {
++    bool found[DUEL_EXODIA_PIECE_COUNT] = {false, false, false, false, false};
++
++    for (int slot = 0; slot < DUEL_HAND_SIZE; slot++) {
++        const int id = side->hand.cards[slot];
++
++        if (
++            id >= DUEL_EXODIA_FIRST_CARD_ID &&
++            id < DUEL_EXODIA_FIRST_CARD_ID + DUEL_EXODIA_PIECE_COUNT
++        ) {
++            found[id - DUEL_EXODIA_FIRST_CARD_ID] = true;
++        }
++    }
++
++    for (int i = 0; i < DUEL_EXODIA_PIECE_COUNT; i++) {
++        if (!found[i]) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
++/* true se o duelo terminou (ja terminado ou por Exodia). */
++static bool CheckExodia() {
++    if (duel.finished) {
++        return true;
++    }
++
++    if (HasAllExodiaPieces(&duel.player)) {
++        FinishDuel(true, DUEL_FINISH_EXODIA);
++        return true;
++    }
++
++    if (HasAllExodiaPieces(&duel.opponent)) {
++        FinishDuel(false, DUEL_FINISH_EXODIA);
++        return true;
++    }
++
++    return false;
++}
++
+ static void CheckLifePoints() {
+     if (duel.player.lifePoints <= 0) {
+         duel.player.lifePoints = 0;
+@@ -475,6 +518,10 @@
+         return;
+     }
+ 
++    if (CheckExodia()) {
++        return;
++    }
++
+     duel.turn = DUEL_TURN_PLAYER;
+     duel.turnNumber++;
+     ResetAttackFlags(&duel.player);
+@@ -864,8 +911,11 @@
+         return true;
+     }
+ 
+-    duel.turn = DUEL_TURN_OPPONENT;
++    if (CheckExodia()) {
++        return true;
++    }
+ 
++    duel.turn = DUEL_TURN_OPPONENT;
+     ResetAttackFlags(&duel.opponent);
+     ExecuteOpponentTurn();
+ 
+@@ -1070,10 +1120,11 @@
+ #endif
+ 
+ 
+-bool DuelEngine_StartWithPlayerDeck(
++bool DuelEngine_StartWithPlayerDeckEx(
+     const uint16_t* playerCardIds,
+     int cardCount,
+-    const DuelistData* opponentDuelist
++    const DuelistData* opponentDuelist,
++    bool shufflePlayerDeck
+ ) {
+     if (
+         playerCardIds == nullptr ||
+@@ -1105,7 +1156,10 @@
+         return false;
+     }
+ 
+-    ShuffleDeck(&duel.player.deck);
++    if (shufflePlayerDeck) {
++        ShuffleDeck(&duel.player.deck);
++    }
++
+     ShuffleDeck(&duel.opponent.deck);
+ 
+     if (!FillHand(&duel.player) || !FillHand(&duel.opponent)) {
+@@ -1118,6 +1172,8 @@
+     duel.finished = false;
+     duel.playerWon = false;
+ 
++    CheckExodia();
++
+     return true;
+ }
+ 
+@@ -1678,3 +1734,207 @@
+ 
+     return true;
+ }
++
++
++bool DuelEngine_StartWithPlayerDeck(
++    const uint16_t* playerCardIds,
++    int cardCount,
++    const DuelistData* opponentDuelist
++) {
++    return DuelEngine_StartWithPlayerDeckEx(
++        playerCardIds, cardCount, opponentDuelist, true
++    );
++}
++
++namespace {
++
++/* Receitas de ritual do disco (WA_MRG.MRG, blob de duelo + 0x34800):
++   { carta de ritual, tributo 1, tributo 2, tributo 3, monstro resultante } */
++const uint16_t kRitualRecipes[][5] = {
++    {670, 27, 38, 58, 364},
++    {671, 85, 298, 377, 360},
++    {673, 201, 403, 483, 356},
++    {674, 186, 261, 595, 365},
++    {675, 1, 1, 1, 380},
++    {665, 255, 296, 629, 362},
++    {666, 29, 31, 101, 357},
++    {667, 371, 372, 373, 374},
++    {676, 249, 395, 511, 701},
++    {677, 14, 295, 547, 702},
++    {678, 3, 64, 453, 703},
++    {679, 160, 161, 535, 704},
++    {680, 6, 47, 571, 705},
++    {691, 168, 294, 604, 706},
++    {692, 89, 449, 451, 710},
++    {693, 102, 182, 220, 720},
++    {694, 178, 269, 288, 709},
++    {695, 166, 405, 416, 715},
++    {696, 52, 480, 533, 717},
++    {697, 239, 378, 621, 716},
++    {698, 266, 635, 638, 708},
++    {699, 146, 479, 485, 719},
++    {700, 436, 441, 542, 718},
++    {721, 7, 35, 417, 722}
++};
++
++constexpr int kRitualRecipeCount =
++    static_cast<int>(sizeof(kRitualRecipes) / sizeof(kRitualRecipes[0]));
++
++/* Deck de teste: DUEL_DECK_SIZE cartas, ordem de compra fixa */
++const uint16_t kTestDeck[DUEL_DECK_SIZE] = {
++    2, /* Mystical Elf */
++    8, /* Mushroom Man */
++    4, /* Baby Dragon */
++    16, /* Time Wizard */
++    657, /* Megamorph */
++    337, /* Raigeki */
++    336, /* Dark Hole */
++    348, /* Swords of Revealing Light */
++    349, /* Spellbinding Circle */
++    661, /* Crush Card */
++    27, /* Beaver Warrior */
++    38, /* Gaia the Fierce Knight */
++    58, /* Kuriboh */
++    670, /* Black Luster Ritual */
++    330, /* Forest */
++    17, /* Right Leg of the Forbidden One */
++    18, /* Left Leg of the Forbidden One */
++    19, /* Right Arm of the Forbidden One */
++    20, /* Left Arm of the Forbidden One */
++    21, /* Exodia the Forbidden */
++    342, /* Dian Keto the Cure Master */
++    344, /* Hinotama */
++    339, /* Red Medicine */
++    655, /* Cursebreaker */
++    320, /* Stop Defense */
++    1, /* Blue-eyes White Dragon */
++    1, /* Blue-eyes White Dragon */
++    1, /* Blue-eyes White Dragon */
++    675, /* Ultimate Dragon */
++    654, /* Salamandra */
++    15, /* Flame Swordsman */
++    334, /* Umi */
++    672, /* Harpie's Feather Duster */
++    329, /* Dragon Capture Jar */
++    669, /* Shadow Spell */
++    721, /* Dark Magic Ritual */
++    7, /* Winged Dragon #1 */
++    35, /* Dark Magician */
++    417, /* Blast Juggler */
++    332, /* Mountain */
++};
++
++}
++
++bool DuelEngine_GetRitualRecipe(int ritualCardId, int* tributes, int* resultCardId) {
++    for (int i = 0; i < kRitualRecipeCount; i++) {
++        if (kRitualRecipes[i][0] != ritualCardId) {
++            continue;
++        }
++
++        if (tributes != nullptr) {
++            for (int j = 0; j < DUEL_RITUAL_TRIBUTE_COUNT; j++) {
++                tributes[j] = kRitualRecipes[i][1 + j];
++            }
++        }
++
++        if (resultCardId != nullptr) {
++            *resultCardId = kRitualRecipes[i][4];
++        }
++
++        return true;
++    }
++
++    return false;
++}
++
++bool DuelEngine_PlayRitualFromHand(int handIndex, DuelSpellOutcome* outcome) {
++    if (
++        duel.finished ||
++        duel.turn != DUEL_TURN_PLAYER ||
++        handIndex < 0 ||
++        handIndex >= DUEL_HAND_SIZE
++    ) {
++        return false;
++    }
++
++    const int cardId = duel.player.hand.cards[handIndex];
++    const CardData* card = GameData_GetCardById(cardId);
++
++    if (card == nullptr || card->type != 22) {
++        return false;
++    }
++
++    int tributes[DUEL_RITUAL_TRIBUTE_COUNT];
++    int resultId = 0;
++
++    if (!DuelEngine_GetRitualRecipe(cardId, tributes, &resultId)) {
++        return false;
++    }
++
++    const CardData* result = GameData_GetCardById(resultId);
++
++    if (result == nullptr) {
++        return false;
++    }
++
++    /* cada tributo toma o primeiro monstro igual ainda nao usado, na ordem da receita */
++    int found[DUEL_RITUAL_TRIBUTE_COUNT] = {-1, -1, -1};
++    bool used[DUEL_FIELD_SIZE] = {false, false, false, false, false};
++
++    for (int j = 0; j < DUEL_RITUAL_TRIBUTE_COUNT; j++) {
++        for (int i = 0; i < DUEL_FIELD_SIZE; i++) {
++            if (!used[i] && duel.player.field[i].cardId == tributes[j]) {
++                found[j] = i;
++                used[i] = true;
++                break;
++            }
++        }
++
++        if (found[j] < 0) {
++            return false;
++        }
++    }
++
++    for (int j = 0; j < DUEL_RITUAL_TRIBUTE_COUNT; j++) {
++        ClearFieldCard(&duel.player.field[found[j]]);
++    }
++
++    /* o resultado ocupa a zona do segundo tributo */
++    DuelFieldCard* field = &duel.player.field[found[1]];
++
++    field->cardId = static_cast<uint16_t>(resultId);
++    field->position = DUEL_POSITION_ATTACK;
++    field->faceUp = true;
++    field->hasAttacked = false;
++    field->attackBonus = 0;
++    field->defenseBonus = 0;
++    field->guardianStar = PickGuardianStar(result, 0);
++
++    duel.player.hand.cards[handIndex] = 0;
++
++    if (outcome != nullptr) {
++        outcome->effectGroup = DUEL_EFFECT_GROUP_RITUAL;
++        outcome->amount = resultId;
++        outcome->affected = 0;
++        outcome->destroyed = DUEL_RITUAL_TRIBUTE_COUNT;
++    }
++
++    return true;
++}
++
++bool DuelEngine_BuildTestDeck(uint16_t* outCards) {
++    if (outCards == nullptr) {
++        return false;
++    }
++
++    for (int i = 0; i < DUEL_DECK_SIZE; i++) {
++        if (GameData_GetCardById(kTestDeck[i]) == nullptr) {
++            return false;
++        }
++
++        outCards[i] = kTestDeck[i];
++    }
++
++    return true;
++}
+diff -u -r -N source.l7/duel/DuelFieldMode.cpp source/duel/DuelFieldMode.cpp
+--- source.l7/duel/DuelFieldMode.cpp	2026-10-24 21:14:36.474460301 +0000
++++ source/duel/DuelFieldMode.cpp	2026-10-24 21:17:12.350867900 +0000
+@@ -132,13 +132,19 @@
+     */
+     std::uint16_t testDeck[DUEL_DECK_SIZE];
+ 
+-    for (int i = 0; i < DUEL_DECK_SIZE; i++) {
+-        testDeck[i] =
+-            static_cast<std::uint16_t>(
+-                kFirstTestCardIndex + i + 1
+-            );
++    if (deckKind_ == 1) {
++        /* deck de teste: ordem fixa, uma mao de cada grupo de cartas */
++        if (!DuelEngine_BuildTestDeck(testDeck)) {
++            return false;
++        }
++    } else {
++        for (int i = 0; i < DUEL_DECK_SIZE; i++) {
++            testDeck[i] =
++                static_cast<std::uint16_t>(
++                    kFirstTestCardIndex + i + 1
++                );
++        }
+     }
+-
+     const DuelistData* opponent =
+         GameData_GetDuelistByIndex(
+             opponentDuelistIndex_
+@@ -163,10 +169,11 @@
+         )
+     );
+ 
+-    if (!DuelEngine_StartWithPlayerDeck(
++    if (!DuelEngine_StartWithPlayerDeckEx(
+         testDeck,
+         DUEL_DECK_SIZE,
+-        opponent
++        opponent,
++        deckKind_ == 0
+     )) {
+         return false;
+     }
+@@ -596,6 +603,12 @@
+         changed = true;
+     }
+ 
++    /* Y alterna o deck: basico ou de teste (todos os tipos de carta) */
++    if (pressed & KEY_Y) {
++        deckKind_ = deckKind_ == 0 ? 1 : 0;
++        changed = true;
++    }
++
+     if (pressed & (KEY_A | KEY_START)) {
+         startDuelWithSelectedDuelist();
+         changed = true;
+@@ -697,6 +710,11 @@
+     if (card->type == 20) {
+         return playMagicFromHand();
+     }
++
++    /* ritual: troca 3 monstros do campo pelo monstro da receita */
++    if (card->type == 22) {
++        return playRitualFromHand();
++    }
+     /* equip: escolhe o monstro em campo que vai recebe-lo */
+     if (card->type == 23) {
+         return beginEquipSelection();
+@@ -889,6 +907,48 @@
+     return true;
+ }
+ 
++bool DuelFieldMode::playRitualFromHand() {
++    const int slot =
++        DuelEngine_FindPlayerHandSlotByOrder(
++            static_cast<int>(
++                selectedHandPosition_
++            )
++        );
++
++    const DuelState* state =
++        DuelEngine_GetState();
++
++    if (slot < 0 || state == nullptr) {
++        return false;
++    }
++
++    const int cardId =
++        state->player.hand.cards[slot];
++
++    DuelSpellOutcome outcome =
++        {DUEL_EFFECT_GROUP_RITUAL, 0, 0, 0};
++
++    const bool played =
++        DuelEngine_PlayRitualFromHand(
++            slot,
++            &outcome
++        );
++
++    if (played) {
++        cardPlayedThisTurn_ = true;
++
++        synchronizeMonsterFieldsFromEngine();
++        synchronizeHandFromEngine();
++    }
++
++    /* sem os 3 tributos so avisa: a carta fica na mao e a jogada nao e gasta */
++    bannerActive_ = true;
++    bannerCardId_ = cardId;
++    bannerOutcome_ = outcome;
++
++    return true;
++}
++
+ int DuelFieldMode::equipCardId() {
+     const DuelState* state =
+         DuelEngine_GetState();
+@@ -2141,7 +2201,8 @@
+ void DuelFieldMode::redraw() {
+     if (duelistMenuActive_) {
+         DuelOverlay_DrawDuelistMenu(
+-            duelistMenuIndex_
++            duelistMenuIndex_,
++            deckKind_
+         );
+ 
+         bgUpdate();
+@@ -2221,8 +2282,30 @@
+             fusionPicks_,
+             fusionPickCount_
+         );
+-    }
++    } else if (
++        !summonSelectionActive_ &&
++        !attackSelectionActive_ &&
++        selectedHandPosition_ < playerHand_.size()
++    ) {
++        /* carta de ritual destacada: mostra a receita */
++        const CardData* highlighted =
++            GameData_GetCardByIndex(
++                static_cast<int>(
++                    playerHand_.cardAt(
++                        selectedHandPosition_
++                    )
++                )
++            );
+ 
++        if (
++            highlighted != nullptr &&
++            highlighted->type == 22
++        ) {
++            DuelOverlay_DrawRitualPanel(
++                highlighted->id
++            );
++        }
++    }
+     DuelOverlay_DrawSwordsBadges();
+ 
+     if (bannerActive_) {
+diff -u -r -N source.l7/duel/DuelOverlays.cpp source/duel/DuelOverlays.cpp
+--- source.l7/duel/DuelOverlays.cpp	2026-10-24 21:14:36.476189513 +0000
++++ source/duel/DuelOverlays.cpp	2026-10-24 21:17:49.689438694 +0000
+@@ -185,6 +185,12 @@
+         case DUEL_EFFECT_GROUP_HARPIES_FEATHER_DUSTER:
+             std::snprintf(message, sizeof(message), "NO MAGIC IN PLAY");
+             break;
++        case DUEL_EFFECT_GROUP_RITUAL:
++            std::snprintf(
++                message, sizeof(message),
++                outcome.amount > 0 ? "RITUAL SUMMON!" : "NEED THE 3 TRIBUTES"
++            );
++            break;
+         default:
+             message[0] = '\0';
+             break;
+@@ -329,6 +335,56 @@
+     PixelText_Draw(kInfoPanelX + 4, kInfoPanelY + 27, line, textColor);
+ }
+ 
++void DuelOverlay_DrawRitualPanel(int ritualCardId) {
++    const DuelState* state = DuelEngine_GetState();
++    int tributes[DUEL_RITUAL_TRIBUTE_COUNT];
++    int resultId = 0;
++
++    if (
++        state == nullptr ||
++        !DuelEngine_GetRitualRecipe(ritualCardId, tributes, &resultId)
++    ) {
++        return;
++    }
++
++    const CardData* result = GameData_GetCardById(resultId);
++
++    if (result == nullptr) {
++        return;
++    }
++
++    drawInfoPanel(4);
++
++    char line[40];
++    char name[24];
++
++    copyName(name, sizeof(name), result->name, 17);
++    PixelText_Draw(kInfoPanelX + 4, kInfoPanelY + 3, name, PixelText_Color(18, 31, 20));
++
++    /* cada tributo toma o primeiro monstro igual ainda nao usado (mesma regra do motor) */
++    bool used[DUEL_FIELD_SIZE] = {false, false, false, false, false};
++
++    for (int j = 0; j < DUEL_RITUAL_TRIBUTE_COUNT; j++) {
++        bool present = false;
++
++        for (int i = 0; i < DUEL_FIELD_SIZE && !present; i++) {
++            if (!used[i] && state->player.field[i].cardId == tributes[j]) {
++                used[i] = true;
++                present = true;
++            }
++        }
++
++        const CardData* tribute = GameData_GetCardById(tributes[j]);
++
++        copyName(name, sizeof(name), tribute != nullptr ? tribute->name : "", 15);
++        std::snprintf(line, sizeof(line), "%c %s", present ? '+' : '-', name);
++        PixelText_Draw(
++            kInfoPanelX + 4, kInfoPanelY + 15 + 12 * j, line,
++            present ? PixelText_Color(18, 31, 20) : PixelText_Color(31, 14, 10)
++        );
++    }
++}
++
+ void DuelOverlay_DrawEquipPanel(int equipCardId, int fieldSlot) {
+     const DuelState* state = DuelEngine_GetState();
+     const CardData* equip = GameData_GetCardById(equipCardId);
+@@ -372,7 +428,7 @@
+     PixelText_Draw(kInfoPanelX + 4, kInfoPanelY + 39, line, textColor);
+ }
+ 
+-void DuelOverlay_DrawDuelistMenu(int selectedIndex) {
++void DuelOverlay_DrawDuelistMenu(int selectedIndex, int deckKind) {
+     const int count = GameData_GetDuelistCount();
+ 
+     Graphics_ClearTop(PixelText_Color(2, 2, 8));
+@@ -383,6 +439,12 @@
+ 
+     PixelText_Draw(8, 6, "SELECT OPPONENT", titleColor);
+ 
++    /* Y alterna entre o deck basico (cartas 1-40 embaralhadas) e o de teste (todos os tipos, ordem fixa) */
++    PixelText_Draw(
++        8, 17,
++        deckKind == 1 ? "Y: DECK TEST" : "Y: DECK BASIC",
++        PixelText_Color(18, 31, 20), 1
++    );
+     char line[40];
+ 
+     std::snprintf(

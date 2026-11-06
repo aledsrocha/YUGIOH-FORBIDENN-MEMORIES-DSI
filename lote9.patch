@@ -1,0 +1,1365 @@
+diff -u -r -N include.l9base/DuelEngine.h include/DuelEngine.h
+--- include.l9base/DuelEngine.h	2026-10-25 05:18:51.596095712 +0000
++++ include/DuelEngine.h	2026-10-26 03:33:34.310134459 +0000
+@@ -63,6 +63,14 @@
+     uint8_t guardianStar; /* 0 = nenhuma; 1..10 = estrela escolhida na invocacao */
+ };
+ 
++#define DUEL_SPELL_TRAP_SIZE 5
++
++/* Carta baixada na fileira de magia/armadilha (virada para baixo ao ser baixada). */
++struct DuelSetCard {
++    uint16_t cardId;
++    bool faceUp;
++};
++
+ struct DuelPlayerState {
+     DuelDeck deck;
+     DuelHand hand;
+@@ -70,6 +78,10 @@
+     int lifePoints;
+     /* Swords of Revealing Light: 4 ao ser jogada, cai 1 a cada turno deste lado; ataca so em 0 */
+     int swordsTurnsRemaining;
++    /* fileira de magia/armadilha (5 zonas) */
++    DuelSetCard spellTrap[DUEL_SPELL_TRAP_SIZE];
++    /* turnos deste lado ja iniciados: o ataque so e liberado a partir do segundo */
++    int turnsTaken;
+ };
+ 
+ struct DuelState {
+@@ -297,6 +309,81 @@
+     as 5 pecas do Exodia; cura, dano e Cursebreaker; ritual Ultimate Dragon; mais magias; Dark Magic Ritual.
+ */
+ bool DuelEngine_BuildTestDeck(uint16_t* outCards);
++
++/*
++    Deck das armadilhas (ordem fixa): as 10 armadilhas, Fake Trap, magias para baixar e ativar
++    (Raigeki, Dark Hole...), Megamorph e monstros de ATK variados.
++    Maos: 1) Baby Dragon, Mystical Elf, House of Adhesive Tape, Bear Trap, Fake Trap
++          2) Eatgaboon, Invisible Wire, Acid Trap Hole, Widespread Ruin, Time Wizard
++          3) Raigeki, Dark Hole, Hinotama, Red Medicine, Megamorph
++          4) Goblin Fan, Bad Reaction to Simochi, Reverse Trap, Harpie's Feather Duster, Stop Defense
++*/
++bool DuelEngine_BuildTrapTestDeck(uint16_t* outCards);
++/*
++    Ataque: 0 = livre; 1 = primeiro turno do lado (ninguem ataca, entao ninguem perde LP);
++    2 = sob Swords of Revealing Light.
++*/
++#define DUEL_ATTACK_BLOCK_NONE 0
++#define DUEL_ATTACK_BLOCK_FIRST_TURN 1
++#define DUEL_ATTACK_BLOCK_SWORDS 2
++int DuelEngine_GetAttackBlock(bool opponent);
++
++/*
++    Monstro baixado virado para baixo: fica em defesa e so e revelado quando ataca, e atacado
++    ou por efeito (Swords, Dark-piercing Light). A fusao tambem pode sair virada.
++*/
++bool DuelEngine_SummonFromHandEx(
++    int handIndex,
++    int fieldIndex,
++    DuelPosition position,
++    bool faceDown
++);
++bool DuelEngine_FuseChainFromHandEx(
++    const int* handSlots,
++    int count,
++    int fieldIndex,
++    DuelPosition position,
++    bool faceDown
++);
++
++/*
++    Baixa uma carta que nao e monstro (magia, armadilha, equip, ritual) virada para baixo na
++    primeira zona livre da fileira de magia/armadilha. Devolve a zona (0..4) ou -1.
++*/
++int DuelEngine_SetCardFromHand(int handIndex);
++
++/*
++    Ativa uma Magic (type 20) baixada: vira e resolve como se fosse jogada da mao. Armadilhas
++    disparam sozinhas; equips e rituais so valem jogados da mao.
++*/
++bool DuelEngine_ActivateSetCard(int zoneIndex, DuelSpellOutcome* outcome);
++
++/* Armadilhas (cartas 681-690), conforme os textos e a tabela de limiares do jogo. */
++#define DUEL_FIRST_ATTACK_TRAP_CARD_ID 681   /* 681-686: eliminam o atacante com ATK <= limiar */
++#define DUEL_GOBLIN_FAN_CARD_ID 687          /* reflete dano direto de magia */
++#define DUEL_BAD_REACTION_CARD_ID 688        /* cura do adversario vira dano nele */
++#define DUEL_REVERSE_TRAP_CARD_ID 689        /* equip do adversario vira penalidade */
++#define DUEL_FAKE_TRAP_CARD_ID 690           /* blefe: nada acontece */
++
++enum DuelEventType {
++    DUEL_EVENT_NONE = 0,
++    DUEL_EVENT_ATTACK_TRAP,   /* trapCardId eliminou o atacante victimCardId */
++    DUEL_EVENT_FAKE_TRAP,
++    DUEL_EVENT_GOBLIN_FAN,    /* amount = dano refletido */
++    DUEL_EVENT_BAD_REACTION,  /* amount = cura virada em dano */
++    DUEL_EVENT_REVERSE_TRAP   /* amount = bonus virado em penalidade */
++};
++
++struct DuelEvent {
++    int type;
++    int trapCardId;
++    bool trapOwnerIsOpponent;
++    int amount;
++    int victimCardId;
++};
++
++/* Fila de eventos para a interface mostrar (armadilhas disparadas). false se vazia. */
++bool DuelEngine_PopEvent(DuelEvent* out);
+ /* Nome em maiusculas ("MARS".."VENUS"); "" se a estrela for invalida. */
+ const char* DuelEngine_GuardianStarName(int star);
+ 
+diff -u -r -N include.l9base/duel/DuelFieldMode.h include/duel/DuelFieldMode.h
+--- include.l9base/duel/DuelFieldMode.h	2026-10-25 05:18:51.595805446 +0000
++++ include/duel/DuelFieldMode.h	2026-10-26 03:33:34.311884613 +0000
+@@ -50,6 +50,12 @@
+     bool playMagicFromHand();
+     bool playRitualFromHand();
+     bool showCardMessage(const char* message);
++    bool showMessage(int cardId, const char* message, bool good);
++    bool beginFaceDownPlay();
++    bool setCardFromHand();
++    bool activateSetCardAtCursor();
++    bool presentNextEvent();
++    bool synchronizeSpellTrapFromEngine();
+     bool beginEquipSelection();
+     int findEquipTarget(int start, int direction);
+     bool moveEquipTarget(int direction);
+@@ -196,9 +202,11 @@
+     bool equipSelectionActive_ = false;
+     int equipHandPosition_ = 0;
+     int equipTargetSlot_ = -1;
+-    int deckKind_ = 0; /* 0 = basico, 1 = teste */
++    int deckKind_ = 0; /* 0 = basico, 1 = teste, 2 = armadilhas */
+     bool bannerActive_ = false;
+     bool bannerIsMessage_ = false;
++    bool bannerGood_ = false;
++    bool selectedFaceDown_ = false;
+     char bannerMessage_[24] = {0};
+     int bannerCardId_ = 0;
+     DuelSpellOutcome bannerOutcome_ = {0, 0, 0, 0};
+diff -u -r -N include.l9base/duel/DuelOverlays.h include/duel/DuelOverlays.h
+--- include.l9base/duel/DuelOverlays.h	2026-10-25 05:18:51.595986663 +0000
++++ include/duel/DuelOverlays.h	2026-10-25 19:49:29.475731874 +0000
+@@ -25,8 +25,10 @@
+ void DuelOverlay_DrawSpellBanner(int cardId, const DuelSpellOutcome& outcome);
+ 
+ /* Aviso curto (ate 21 letras) sobre uma carta que nao pode ser jogada agora. */
+-void DuelOverlay_DrawMessageBanner(int cardId, const char* message);
++void DuelOverlay_DrawMessageBanner(int cardId, const char* message, bool good = false);
+ 
++/* Etiqueta da jogada de monstro: virado para baixo ou para cima (tecla R). */
++void DuelOverlay_DrawSetBadge(bool faceDown);
+ /* Selos de Swords of Revealing Light (quem esta impedido de atacar e por quantos turnos). */
+ void DuelOverlay_DrawSwordsBadges();
+ 
+diff -u -r -N source.l9base/DuelEngine.cpp source/DuelEngine.cpp
+--- source.l9base/DuelEngine.cpp	2026-10-25 05:18:51.593667433 +0000
++++ source/DuelEngine.cpp	2026-10-26 03:33:34.309665105 +0000
+@@ -24,6 +24,8 @@
+ 
+     memset(state, 0, sizeof(DuelPlayerState));
+     state->lifePoints = DUEL_START_LP;
++    /* caminhos legados e de teste: sem trava de primeiro turno (a partida real a liga) */
++    state->turnsTaken = 2;
+ }
+ 
+ /*
+@@ -271,6 +273,104 @@
+     return value;
+ }
+ 
++/* ---------- fila de eventos (armadilhas disparadas) ---------- */
++static DuelEvent gEvents[16];
++static int gEventHead = 0;
++static int gEventCount = 0;
++
++static void ClearEvents() {
++    gEventHead = 0;
++    gEventCount = 0;
++}
++
++static void PushEvent(int type, int trapCardId, bool opponentOwns, int amount, int victimCardId) {
++    if (gEventCount >= 16) {
++        return;
++    }
++
++    DuelEvent& e = gEvents[(gEventHead + gEventCount) % 16];
++
++    e.type = type;
++    e.trapCardId = trapCardId;
++    e.trapOwnerIsOpponent = opponentOwns;
++    e.amount = amount;
++    e.victimCardId = victimCardId;
++    gEventCount++;
++}
++
++/* Limiares de ATK das armadilhas 681-686 (gDuel_abTrapAttackThresholds * 100) */
++static const int kAttackTrapThreshold[6] = {500, 1000, 1500, 2000, 3000, 25500};
++
++/* Consome a primeira armadilha baixada `trapId` do dono. true se havia. */
++static bool ConsumeSetTrap(DuelPlayerState* owner, int trapId, int type, int amount, int victimCardId) {
++    for (int i = 0; i < DUEL_SPELL_TRAP_SIZE; i++) {
++        if (owner->spellTrap[i].cardId == trapId) {
++            owner->spellTrap[i].cardId = 0;
++            owner->spellTrap[i].faceUp = false;
++            PushEvent(type, trapId, owner == &duel.opponent, amount, victimCardId);
++            return true;
++        }
++    }
++
++    return false;
++}
++
++/*
++    Duel_SelectAttackTrap: as armadilhas baixadas do defensor disparam quando o ATK do
++    atacante (com equips e terreno, sem estrela) e <= limiar. Vale a de menor id. Sem
++    nenhuma elegivel, a Fake Trap (se houver) dispara e a batalha segue. true = atacante eliminado.
++*/
++static bool ResolveAttackTrap(
++    DuelPlayerState* attackerOwner,
++    DuelPlayerState* defenderOwner,
++    int attackerIndex,
++    int attackerPower
++) {
++    int chosen = -1;
++    int chosenId = 0;
++    int fake = -1;
++
++    for (int i = 0; i < DUEL_SPELL_TRAP_SIZE; i++) {
++        const int id = defenderOwner->spellTrap[i].cardId;
++
++        if (id == DUEL_FAKE_TRAP_CARD_ID && fake < 0) {
++            fake = i;
++        }
++
++        const int index = id - DUEL_FIRST_ATTACK_TRAP_CARD_ID;
++
++        if (index < 0 || index >= 6) {
++            continue;
++        }
++
++        if (attackerPower <= kAttackTrapThreshold[index] && (chosen < 0 || id < chosenId)) {
++            chosen = i;
++            chosenId = id;
++        }
++    }
++
++    DuelFieldCard* attacker = &attackerOwner->field[attackerIndex];
++
++    if (chosen >= 0) {
++        const int victim = attacker->cardId;
++
++        defenderOwner->spellTrap[chosen].cardId = 0;
++        defenderOwner->spellTrap[chosen].faceUp = false;
++        PushEvent(DUEL_EVENT_ATTACK_TRAP, chosenId, defenderOwner == &duel.opponent, attackerPower, victim);
++        ClearFieldCard(attacker);
++
++        return true;
++    }
++
++    if (fake >= 0) {
++        defenderOwner->spellTrap[fake].cardId = 0;
++        defenderOwner->spellTrap[fake].faceUp = false;
++        PushEvent(DUEL_EVENT_FAKE_TRAP, DUEL_FAKE_TRAP_CARD_ID, defenderOwner == &duel.opponent, 0, attacker->cardId);
++    }
++
++    return false;
++}
++
+ static bool ResolveBattle(
+     DuelPlayerState* attackerOwner,
+     DuelPlayerState* defenderOwner,
+@@ -311,9 +411,15 @@
+             return false;
+         }
+ 
+-        defenderOwner->lifePoints -= attackerPower;
+         attacker->hasAttacked = true;
+ 
++        if (ResolveAttackTrap(attackerOwner, defenderOwner, attackerIndex, attackerPower)) {
++            CheckLifePoints();
++            return true;
++        }
++
++        attacker->faceUp = true;
++        defenderOwner->lifePoints -= attackerPower;
+         CheckLifePoints();
+         return true;
+     }
+@@ -331,6 +437,15 @@
+ 
+     attacker->hasAttacked = true;
+ 
++    if (ResolveAttackTrap(attackerOwner, defenderOwner, attackerIndex, attackerPower)) {
++        CheckLifePoints();
++        return true;
++    }
++
++    /* quem ataca e quem e atacado viram para cima */
++    attacker->faceUp = true;
++    defender->faceUp = true;
++
+     /*
+         Estrela guardia (Duel_CalcBattleAttack do original): o bonus assinado
+         (+500 vence, -500 perde) vai SO no atacante; o defensor usa o valor cru.
+@@ -465,10 +580,9 @@
+ 
+ static void OpponentAttackAutomatically() {
+     /* Swords of Revealing Light: o lado afetado nao ataca enquanto o contador for > 0 */
+-    if (duel.opponent.swordsTurnsRemaining != 0) {
++    if (DuelEngine_GetAttackBlock(true) != DUEL_ATTACK_BLOCK_NONE) {
+         return;
+     }
+-
+     for (
+         int attackerIndex = 0;
+         attackerIndex < DUEL_FIELD_SIZE;
+@@ -506,6 +620,7 @@
+         duel.opponent.swordsTurnsRemaining--;
+     }
+ 
++    duel.opponent.turnsTaken++;
+     OpponentSummonAutomatically();
+     OpponentAttackAutomatically();
+ 
+@@ -529,6 +644,8 @@
+     if (duel.player.swordsTurnsRemaining > 0) {
+         duel.player.swordsTurnsRemaining--;
+     }
++
++    duel.player.turnsTaken++;
+ }
+ 
+ bool DuelEngine_Start(
+@@ -669,10 +786,11 @@
+     return true;
+ }
+ 
+-bool DuelEngine_SummonFromHand(
++bool DuelEngine_SummonFromHandEx(
+     int handIndex,
+     int fieldIndex,
+-    DuelPosition position
++    DuelPosition position,
++    bool faceDown
+ ) {
+     if (duel.finished || duel.turn != DUEL_TURN_PLAYER) {
+         return false;
+@@ -710,8 +828,9 @@
+     field->cardId =
+         duel.player.hand.cards[handIndex];
+ 
+-    field->position = position;
+-    field->faceUp = true;
++    /* virada para baixo = defesa escondida */
++    field->position = faceDown ? DUEL_POSITION_DEFENSE : position;
++    field->faceUp = !faceDown;
+     field->hasAttacked = false;
+     field->attackBonus = 0;
+     field->defenseBonus = 0;
+@@ -823,9 +942,15 @@
+         return false;
+     }
+ 
+-    monster->attackBonus += DuelEngine_GetEquipBonus(equipCardId);
+-    monster->defenseBonus += DuelEngine_GetEquipBonus(equipCardId);
++    int bonus = DuelEngine_GetEquipBonus(equipCardId);
+ 
++    /* Reverse Trap do adversario: o power-up vira penalidade */
++    if (ConsumeSetTrap(&duel.opponent, DUEL_REVERSE_TRAP_CARD_ID, DUEL_EVENT_REVERSE_TRAP, bonus, monster->cardId)) {
++        bonus = -bonus;
++    }
++
++    monster->attackBonus += bonus;
++    monster->defenseBonus += bonus;
+     duel.player.hand.cards[equipHandIndex] = 0;
+ 
+     return true;
+@@ -868,7 +993,7 @@
+     if (duel.finished || duel.turn != DUEL_TURN_PLAYER) {
+         return false;
+     }
+-    if (duel.player.swordsTurnsRemaining != 0) {
++    if (DuelEngine_GetAttackBlock(false) != DUEL_ATTACK_BLOCK_NONE) {
+         return false;
+     }
+     return ResolveBattle(
+@@ -1172,6 +1297,11 @@
+     duel.finished = false;
+     duel.playerWon = false;
+ 
++    /* o jogador comeca o primeiro turno dele; a CPU ainda nao comecou o dela */
++    duel.player.turnsTaken = 1;
++    duel.opponent.turnsTaken = 0;
++    ClearEvents();
++
+     CheckExodia();
+ 
+     return true;
+@@ -1376,11 +1506,12 @@
+     return true;
+ }
+ 
+-bool DuelEngine_FuseChainFromHand(
++bool DuelEngine_FuseChainFromHandEx(
+     const int* handSlots,
+     int count,
+     int fieldIndex,
+-    DuelPosition position
++    DuelPosition position,
++    bool faceDown
+ ) {
+     if (
+         duel.finished ||
+@@ -1406,9 +1537,24 @@
+ 
+     DuelFieldCard* field = &duel.player.field[fieldIndex];
+ 
++    /* Reverse Trap do adversario: os equips da cadeia viram penalidade */
++    if (
++        (current.attackBonus > 0 || current.defenseBonus > 0) &&
++        ConsumeSetTrap(
++            &duel.opponent,
++            DUEL_REVERSE_TRAP_CARD_ID,
++            DUEL_EVENT_REVERSE_TRAP,
++            current.attackBonus,
++            current.id
++        )
++    ) {
++        current.attackBonus = -current.attackBonus;
++        current.defenseBonus = -current.defenseBonus;
++    }
++
+     field->cardId = static_cast<uint16_t>(current.id);
+-    field->position = position;
+-    field->faceUp = true;
++    field->position = faceDown ? DUEL_POSITION_DEFENSE : position;
++    field->faceUp = !faceDown;
+     field->hasAttacked = false;
+     field->attackBonus = current.attackBonus;
+     field->defenseBonus = current.defenseBonus;
+@@ -1535,21 +1681,10 @@
+ 
+ }
+ 
+-bool DuelEngine_PlaySpellFromHand(int handIndex, DuelSpellOutcome* outcome) {
++static bool ApplyMagic(int cardId, DuelSpellOutcome* outcome) {
+     DuelSpellOutcome result = {0, 0, 0, 0};
+ 
+-    if (
+-        duel.finished ||
+-        duel.turn != DUEL_TURN_PLAYER ||
+-        handIndex < 0 ||
+-        handIndex >= DUEL_HAND_SIZE
+-    ) {
+-        return false;
+-    }
+-
+-    const int cardId = duel.player.hand.cards[handIndex];
+     const CardData* card = GameData_GetCardById(cardId);
+-
+     /* so cartas Magic (type 20); equips, armadilhas e rituais tem fluxo proprio */
+     if (card == nullptr || card->type != 20) {
+         return false;
+@@ -1584,9 +1719,19 @@
+             /* sobe ate o maximo (8000), sem reduzir quem ja esta acima */
+             const int ceiling =
+                 me->lifePoints > DUEL_START_LP ? me->lifePoints : DUEL_START_LP;
+-            int healed = me->lifePoints + kLifeRecovery[index];
++            /* Bad Reaction to Simochi do adversario: a cura vira dano em quem jogou */
++            if (ConsumeSetTrap(foe, DUEL_BAD_REACTION_CARD_ID, DUEL_EVENT_BAD_REACTION, kLifeRecovery[index], cardId)) {
++                me->lifePoints -= kLifeRecovery[index];
++
++                if (me->lifePoints < 0) {
++                    me->lifePoints = 0;
++                }
++            } else {
++                int healed = me->lifePoints + kLifeRecovery[index];
++
++                me->lifePoints = healed > ceiling ? ceiling : healed;
++            }
+ 
+-            me->lifePoints = healed > ceiling ? ceiling : healed;
+             result.amount = kLifeRecovery[index];
+             break;
+         }
+@@ -1598,12 +1743,18 @@
+                 return false;
+             }
+ 
+-            foe->lifePoints -= kDirectDamage[index];
++            /* Goblin Fan do adversario: o dano volta para quem jogou */
++            DuelPlayerState* victim = foe;
+ 
+-            if (foe->lifePoints < 0) {
+-                foe->lifePoints = 0;
++            if (ConsumeSetTrap(foe, DUEL_GOBLIN_FAN_CARD_ID, DUEL_EVENT_GOBLIN_FAN, kDirectDamage[index], cardId)) {
++                victim = me;
+             }
+ 
++            victim->lifePoints -= kDirectDamage[index];
++
++            if (victim->lifePoints < 0) {
++                victim->lifePoints = 0;
++            }
+             result.amount = kDirectDamage[index];
+             break;
+         }
+@@ -1717,24 +1868,73 @@
+             break;
+ 
+         case DUEL_EFFECT_GROUP_HARPIES_FEATHER_DUSTER:
+-            /* destroi as magias e armadilhas do adversario em campo: ainda nao ha nenhuma */
++            /* destroi as magias e armadilhas do adversario em campo (viradas ou nao) */
++            for (int i = 0; i < DUEL_SPELL_TRAP_SIZE; i++) {
++                if (foe->spellTrap[i].cardId != 0) {
++                    foe->spellTrap[i].cardId = 0;
++                    foe->spellTrap[i].faceUp = false;
++                    result.destroyed++;
++                }
++            }
+             break;
+-
+         default:
+             return false;
+     }
+ 
+-    duel.player.hand.cards[handIndex] = 0;
+-
+     if (outcome != nullptr) {
+         *outcome = result;
+     }
+ 
++    return true;
++}
++
++bool DuelEngine_PlaySpellFromHand(int handIndex, DuelSpellOutcome* outcome) {
++    if (
++        duel.finished ||
++        duel.turn != DUEL_TURN_PLAYER ||
++        handIndex < 0 ||
++        handIndex >= DUEL_HAND_SIZE
++    ) {
++        return false;
++    }
++
++    const int cardId = duel.player.hand.cards[handIndex];
++
++    if (cardId == 0 || !ApplyMagic(cardId, outcome)) {
++        return false;
++    }
++
++    duel.player.hand.cards[handIndex] = 0;
++
+     CheckLifePoints();
+ 
+     return true;
+ }
+ 
++bool DuelEngine_ActivateSetCard(int zoneIndex, DuelSpellOutcome* outcome) {
++    if (
++        duel.finished ||
++        duel.turn != DUEL_TURN_PLAYER ||
++        zoneIndex < 0 ||
++        zoneIndex >= DUEL_SPELL_TRAP_SIZE
++    ) {
++        return false;
++    }
++
++    DuelSetCard& slot = duel.player.spellTrap[zoneIndex];
++
++    /* so Magic (type 20) se ativa; armadilhas disparam sozinhas */
++    if (slot.cardId == 0 || !ApplyMagic(slot.cardId, outcome)) {
++        return false;
++    }
++
++    slot.cardId = 0;
++    slot.faceUp = false;
++
++    CheckLifePoints();
++
++    return true;
++}
+ 
+ bool DuelEngine_StartWithPlayerDeck(
+     const uint16_t* playerCardIds,
+@@ -1923,6 +2123,70 @@
+     return true;
+ }
+ 
++namespace {
++
++/* Deck das armadilhas: ordem de compra fixa (4 maos de 5 + monstros de ATK variados) */
++const uint16_t kTrapTestDeck[DUEL_DECK_SIZE] = {
++    4, /* Baby Dragon */
++    2, /* Mystical Elf */
++    681, /* House of Adhesive Tape */
++    683, /* Bear Trap */
++    690, /* Fake Trap */
++    682, /* Eatgaboon */
++    684, /* Invisible Wire */
++    685, /* Acid Trap Hole */
++    686, /* Widespread Ruin */
++    16, /* Time Wizard */
++    337, /* Raigeki */
++    336, /* Dark Hole */
++    344, /* Hinotama */
++    339, /* Red Medicine */
++    657, /* Megamorph */
++    687, /* Goblin Fan */
++    688, /* Bad Reaction to Simochi */
++    689, /* Reverse Trap */
++    672, /* Harpie's Feather Duster */
++    320, /* Stop Defense */
++    1, /* Blue-eyes White Dragon */
++    1, /* Blue-eyes White Dragon */
++    15, /* Flame Swordsman */
++    38, /* Gaia the Fierce Knight */
++    27, /* Beaver Warrior */
++    58, /* Kuriboh */
++    8, /* Mushroom Man */
++    35, /* Dark Magician */
++    7, /* Winged Dragon #1 */
++    417, /* Blast Juggler */
++    4, /* Baby Dragon */
++    2, /* Mystical Elf */
++    16, /* Time Wizard */
++    15, /* Flame Swordsman */
++    38, /* Gaia the Fierce Knight */
++    27, /* Beaver Warrior */
++    58, /* Kuriboh */
++    8, /* Mushroom Man */
++    4, /* Baby Dragon */
++    2, /* Mystical Elf */
++};
++
++}
++
++bool DuelEngine_BuildTrapTestDeck(uint16_t* outCards) {
++    if (outCards == nullptr) {
++        return false;
++    }
++
++    for (int i = 0; i < DUEL_DECK_SIZE; i++) {
++        if (GameData_GetCardById(kTrapTestDeck[i]) == nullptr) {
++            return false;
++        }
++
++        outCards[i] = kTrapTestDeck[i];
++    }
++
++    return true;
++}
++
+ bool DuelEngine_BuildTestDeck(uint16_t* outCards) {
+     if (outCards == nullptr) {
+         return false;
+@@ -1938,3 +2202,83 @@
+ 
+     return true;
+ }
++
++
++/* ---------- API publica do lote 9 ---------- */
++
++int DuelEngine_GetAttackBlock(bool opponent) {
++    const DuelPlayerState* side = opponent ? &duel.opponent : &duel.player;
++
++    if (side->turnsTaken < 2) {
++        return DUEL_ATTACK_BLOCK_FIRST_TURN;
++    }
++
++    if (side->swordsTurnsRemaining != 0) {
++        return DUEL_ATTACK_BLOCK_SWORDS;
++    }
++
++    return DUEL_ATTACK_BLOCK_NONE;
++}
++
++bool DuelEngine_SummonFromHand(
++    int handIndex,
++    int fieldIndex,
++    DuelPosition position
++) {
++    return DuelEngine_SummonFromHandEx(handIndex, fieldIndex, position, false);
++}
++
++bool DuelEngine_FuseChainFromHand(
++    const int* handSlots,
++    int count,
++    int fieldIndex,
++    DuelPosition position
++) {
++    return DuelEngine_FuseChainFromHandEx(handSlots, count, fieldIndex, position, false);
++}
++
++int DuelEngine_SetCardFromHand(int handIndex) {
++    if (
++        duel.finished ||
++        duel.turn != DUEL_TURN_PLAYER ||
++        handIndex < 0 ||
++        handIndex >= DUEL_HAND_SIZE
++    ) {
++        return -1;
++    }
++
++    const int cardId = duel.player.hand.cards[handIndex];
++    const CardData* card = GameData_GetCardById(cardId);
++
++    /* monstros vao para o campo de monstros (DuelEngine_SummonFromHandEx) */
++    if (card == nullptr || card->type < DUEL_FIRST_NON_MONSTER_TYPE) {
++        return -1;
++    }
++
++    for (int i = 0; i < DUEL_SPELL_TRAP_SIZE; i++) {
++        if (duel.player.spellTrap[i].cardId == 0) {
++            duel.player.spellTrap[i].cardId = static_cast<uint16_t>(cardId);
++            duel.player.spellTrap[i].faceUp = false;
++            duel.player.hand.cards[handIndex] = 0;
++
++            return i;
++        }
++    }
++
++    return -1;
++}
++
++bool DuelEngine_PopEvent(DuelEvent* out) {
++    if (gEventCount == 0) {
++        return false;
++    }
++
++    if (out != nullptr) {
++        *out = gEvents[gEventHead];
++    }
++
++    gEventHead = (gEventHead + 1) % 16;
++    gEventCount--;
++
++    return true;
++}
+diff -u -r -N source.l9base/duel/DuelFieldMode.cpp source/duel/DuelFieldMode.cpp
+--- source.l9base/duel/DuelFieldMode.cpp	2026-10-25 05:18:51.593269873 +0000
++++ source/duel/DuelFieldMode.cpp	2026-10-26 03:33:34.311479083 +0000
+@@ -137,6 +137,11 @@
+         if (!DuelEngine_BuildTestDeck(testDeck)) {
+             return false;
+         }
++    } else if (deckKind_ == 2) {
++        /* deck das armadilhas: ordem fixa */
++        if (!DuelEngine_BuildTrapTestDeck(testDeck)) {
++            return false;
++        }
+     } else {
+         for (int i = 0; i < DUEL_DECK_SIZE; i++) {
+             testDeck[i] =
+@@ -448,10 +453,11 @@
+         O motor decide. Se recusar, nada mudou na tela
+         e nao ha o que desfazer.
+     */
+-    if (!DuelEngine_SummonFromHand(
++    if (!DuelEngine_SummonFromHandEx(
+         engineHandSlot,
+         selectedSummonSlot_,
+-        enginePosition
++        enginePosition,
++        selectedFaceDown_
+     )) {
+         return false;
+     }
+@@ -603,9 +609,9 @@
+         changed = true;
+     }
+ 
+-    /* Y alterna o deck: basico ou de teste (todos os tipos de carta) */
++    /* Y alterna o deck: basico, de teste (todos os tipos) ou das armadilhas */
+     if (pressed & KEY_Y) {
+-        deckKind_ = deckKind_ == 0 ? 1 : 0;
++        deckKind_ = (deckKind_ + 1) % 3;
+         changed = true;
+     }
+ 
+@@ -723,6 +729,11 @@
+     if (card->type == 22) {
+         return playRitualFromHand();
+     }
++
++    /* armadilha nao se usa na hora: so baixada, virada para baixo */
++    if (card->type == 21) {
++        return setCardFromHand();
++    }
+     /* equip: escolhe o monstro em campo que vai recebe-lo */
+     if (card->type == 23) {
+         if (beginEquipSelection()) {
+@@ -848,11 +859,12 @@
+                 ? DUEL_POSITION_DEFENSE
+                 : DUEL_POSITION_ATTACK;
+ 
+-    if (!DuelEngine_FuseChainFromHand(
++    if (!DuelEngine_FuseChainFromHandEx(
+         slots,
+         fusionPickCount_,
+         selectedSummonSlot_,
+-        enginePosition
++        enginePosition,
++        selectedFaceDown_
+     )) {
+         return false;
+     }
+@@ -920,11 +932,50 @@
+     return true;
+ }
+ 
+-bool DuelFieldMode::showCardMessage(const char* message) {
+-    if (selectedHandPosition_ >= playerHand_.size()) {
++bool DuelFieldMode::showMessage(
++    int cardId,
++    const char* message,
++    bool good
++) {
++    std::snprintf(
++        bannerMessage_,
++        sizeof(bannerMessage_),
++        "%s",
++        message
++    );
++
++    bannerActive_ = true;
++    bannerIsMessage_ = true;
++    bannerGood_ = good;
++    bannerCardId_ = cardId;
++
++    return true;
++}
++
++bool DuelFieldMode::beginFaceDownPlay() {
++    if (
++        isDuelFinished() ||
++        summonSelectionActive_ ||
++        selectedHandPosition_ >= playerHand_.size()
++    ) {
+         return false;
+     }
+ 
++    if (cardPlayedThisTurn_) {
++        return showCardMessage("ALREADY PLAYED A CARD");
++    }
++
++    /* cartas marcadas com Y: fusao baixada virada */
++    if (fusionPickCount_ > 0) {
++        if (!beginChainSummonSelection()) {
++            return false;
++        }
++
++        selectedFaceDown_ = true;
++
++        return true;
++    }
++
+     const CardData* card =
+         GameData_GetCardByIndex(
+             static_cast<int>(
+@@ -938,20 +989,277 @@
+         return false;
+     }
+ 
+-    std::snprintf(
+-        bannerMessage_,
+-        sizeof(bannerMessage_),
+-        "%s",
+-        message
+-    );
++    /* monstro: escolhe a zona ja com a opcao virada para baixo ligada (R desliga) */
++    if (card->type < 20) {
++        if (!beginSummonSelection()) {
++            return false;
++        }
++
++        selectedFaceDown_ = true;
++
++        return true;
++    }
++
++    /* magia, armadilha, equip e ritual: vao para a fileira de magia/armadilha */
++    return setCardFromHand();
++}
++
++bool DuelFieldMode::setCardFromHand() {
++    const int slot =
++        DuelEngine_FindPlayerHandSlotByOrder(
++            static_cast<int>(
++                selectedHandPosition_
++            )
++        );
++
++    const DuelState* state =
++        DuelEngine_GetState();
++
++    if (slot < 0 || state == nullptr) {
++        return false;
++    }
++
++    const int cardId =
++        state->player.hand.cards[slot];
++
++    if (DuelEngine_SetCardFromHand(slot) < 0) {
++        return showCardMessage("SPELL/TRAP ROW FULL");
++    }
++
++    cardPlayedThisTurn_ = true;
++
++    synchronizeMonsterFieldsFromEngine();
++    synchronizeHandFromEngine();
++
++    return showMessage(cardId, "SET FACE DOWN", true);
++}
++
++bool DuelFieldMode::activateSetCardAtCursor() {
++    const FieldZone* zone =
++        cursor_.currentZone();
++
++    if (
++        zone == nullptr ||
++        zone->side() != FieldSide::Player ||
++        zone->type() != FieldZoneType::SpellTrap ||
++        !zone->isOccupied() ||
++        isDuelFinished()
++    ) {
++        return false;
++    }
++
++    const DuelState* state =
++        DuelEngine_GetState();
++
++    /* FieldZone::index() e o indice global: acha o slot (0-4) na fileira do jogador */
++    int slot = -1;
++
++    for (int i = 0; i < DUEL_SPELL_TRAP_SIZE; i++) {
++        if (
++            field_.findZone(
++                FieldSide::Player,
++                FieldZoneType::SpellTrap,
++                static_cast<std::uint8_t>(i)
++            ) == zone
++        ) {
++            slot = i;
++        }
++    }
++
++    if (
++        state == nullptr ||
++        slot < 0
++    ) {
++        return false;
++    }
++    const int cardId =
++        state->player.spellTrap[slot].cardId;
++
++    const CardData* card =
++        GameData_GetCardById(cardId);
++
++    if (card == nullptr) {
++        return false;
++    }
++
++    if (cardPlayedThisTurn_) {
++        return showMessage(cardId, "ALREADY PLAYED A CARD", false);
++    }
++
++    if (card->type == 21) {
++        return showMessage(cardId, "TRIGGERS BY ITSELF", false);
++    }
++
++    if (card->type != 20) {
++        return showMessage(cardId, "PLAY IT FROM THE HAND", false);
++    }
++
++    DuelSpellOutcome outcome =
++        {0, 0, 0, 0};
++
++    if (!DuelEngine_ActivateSetCard(slot, &outcome)) {
++        return false;
++    }
++
++    cardPlayedThisTurn_ = true;
+ 
+     bannerActive_ = true;
+-    bannerIsMessage_ = true;
+-    bannerCardId_ = card->id;
++    bannerIsMessage_ = false;
++    bannerCardId_ = cardId;
++    bannerOutcome_ = outcome;
++
++    synchronizeMonsterFieldsFromEngine();
++    synchronizeHandFromEngine();
+ 
+     return true;
+ }
+ 
++bool DuelFieldMode::presentNextEvent() {
++    DuelEvent event;
++
++    if (!DuelEngine_PopEvent(&event)) {
++        return false;
++    }
++
++    const char* message = "";
++
++    switch (event.type) {
++        case DUEL_EVENT_ATTACK_TRAP:
++            message = "ATTACKER DESTROYED";
++            break;
++        case DUEL_EVENT_FAKE_TRAP:
++            message = "NOTHING HAPPENS";
++            break;
++        case DUEL_EVENT_GOBLIN_FAN:
++            message = "DAMAGE REFLECTED";
++            break;
++        case DUEL_EVENT_BAD_REACTION:
++            message = "HEAL TURNED TO DAMAGE";
++            break;
++        case DUEL_EVENT_REVERSE_TRAP:
++            message = "POWER-UP REVERSED";
++            break;
++        default:
++            break;
++    }
++
++    /* verde: a armadilha e do jogador; vermelho: a CPU armou contra ele */
++    synchronizeMonsterFieldsFromEngine();
++
++    return showMessage(
++        event.trapCardId,
++        message,
++        !event.trapOwnerIsOpponent
++    );
++}
++
++namespace {
++
++/* Espelha uma carta da fileira de magia/armadilha do motor numa zona visual. */
++bool syncSpellTrapZone(
++    FieldZone* zone,
++    const DuelSetCard& engineCard
++) {
++    if (
++        zone == nullptr ||
++        zone->type() != FieldZoneType::SpellTrap
++    ) {
++        return false;
++    }
++
++    if (engineCard.cardId == 0) {
++        if (zone->isOccupied()) {
++            zone->clear();
++        }
++
++        return true;
++    }
++
++    const std::uint16_t visualCardIndex =
++        static_cast<std::uint16_t>(
++            engineCard.cardId - 1
++        );
++
++    if (
++        zone->isOccupied() &&
++        zone->cardIndex() != visualCardIndex
++    ) {
++        zone->clear();
++    }
++
++    if (zone->isEmpty()) {
++        return zone->placeCard(
++            visualCardIndex,
++            engineCard.faceUp,
++            MonsterPosition::Attack
++        );
++    }
++
++    zone->setFaceUp(engineCard.faceUp);
++
++    return true;
++}
++
++}
++
++bool DuelFieldMode::synchronizeSpellTrapFromEngine() {
++    const DuelState* state =
++        DuelEngine_GetState();
++
++    if (state == nullptr) {
++        return false;
++    }
++
++    bool ok = true;
++
++    for (int slot = 0; slot < DUEL_SPELL_TRAP_SIZE; slot++) {
++        ok = syncSpellTrapZone(
++            field_.findZone(
++                FieldSide::Player,
++                FieldZoneType::SpellTrap,
++                static_cast<std::uint8_t>(slot)
++            ),
++            state->player.spellTrap[slot]
++        ) && ok;
++
++        ok = syncSpellTrapZone(
++            field_.findZone(
++                FieldSide::Opponent,
++                FieldZoneType::SpellTrap,
++                static_cast<std::uint8_t>(slot)
++            ),
++            state->opponent.spellTrap[slot]
++        ) && ok;
++    }
++
++    return ok;
++}
++
++bool DuelFieldMode::showCardMessage(const char* message) {
++    if (selectedHandPosition_ >= playerHand_.size()) {
++        return false;
++    }
++
++    const CardData* card =
++        GameData_GetCardByIndex(
++            static_cast<int>(
++                playerHand_.cardAt(
++                    selectedHandPosition_
++                )
++            )
++        );
++
++    if (card == nullptr) {
++        return false;
++    }
++
++    return showMessage(
++        card->id,
++        message,
++        false
++    );
++}
++
+ bool DuelFieldMode::playRitualFromHand() {
+     const int slot =
+         DuelEngine_FindPlayerHandSlotByOrder(
+@@ -1264,6 +1572,7 @@
+     summonSelectionActive_ = false;
+     summonTargetConfirmed_ = false;
+     selectedGuardianChoice_ = 0;
++    selectedFaceDown_ = false;
+ }
+ 
+ FieldZone* DuelFieldMode::playerMonsterZone(
+@@ -1606,7 +1915,7 @@
+         }
+     }
+ 
+-    return true;
++    return synchronizeSpellTrapFromEngine();
+ }
+ 
+ bool DuelFieldMode::selectFirstPlayerMonsterZone() {
+@@ -1655,6 +1964,24 @@
+         return false;
+     }
+ 
++    /* primeiro turno ou Swords: explica por que nao da para atacar */
++    {
++        const int block =
++            DuelEngine_GetAttackBlock(false);
++
++        if (
++            !isDuelFinished() &&
++            block != DUEL_ATTACK_BLOCK_NONE
++        ) {
++            return showMessage(
++                0,
++                block == DUEL_ATTACK_BLOCK_FIRST_TURN
++                    ? "NO ATTACK ON 1ST TURN"
++                    : "SWORDS: NO ATTACK",
++                false
++            );
++        }
++    }
+     FieldZone* currentZone =
+         cursor_.currentZone();
+ 
+@@ -2039,6 +2366,10 @@
+                 changed;
+         }
+ 
++        if (!bannerActive_ && presentNextEvent()) {
++            changed = true;
++        }
++
+         if (changed) {
+             redraw();
+         }
+@@ -2102,12 +2433,21 @@
+                 changed;
+         }
+ 
++        /* UP baixa a carta destacada virada para baixo (monstro no campo, o resto na fileira) */
++        if (pressed & KEY_UP) {
++            changed =
++                beginFaceDownPlay() ||
++                changed;
++        }
++
+         /*
+             X sobre um monstro do jogador inicia
+             a seleÃ§Ã£o do atacante.
+         */
+         if (pressed & KEY_X) {
++            /* X sobre uma magia baixada a ativa; sobre um monstro, ataca */
+             changed =
++                activateSetCardAtCursor() ||
+                 beginAttackSelection() ||
+                 changed;
+         }
+@@ -2209,6 +2549,15 @@
+         }
+     }
+ 
++    /* R alterna a carta entre virada para baixo (defesa escondida) e para cima */
++    if (
++        summonSelectionActive_ &&
++        (pressed & KEY_R)
++    ) {
++        selectedFaceDown_ = !selectedFaceDown_;
++        changed = true;
++    }
++
+     /* UP/DOWN troca a estrela guardia da carta que esta sendo invocada */
+     if (
+         summonSelectionActive_ &&
+@@ -2239,6 +2588,15 @@
+         changed = true;
+     }
+ 
++    /* armadilhas disparadas (suas ou da CPU): um aviso por vez, a cada tecla */
++    if (
++        !duelistMenuActive_ &&
++        !bannerActive_ &&
++        presentNextEvent()
++    ) {
++        changed = true;
++    }
++
+     if (changed) {
+         redraw();
+     }
+@@ -2311,10 +2669,15 @@
+         );
+     }
+ 
++    if (summonSelectionActive_) {
++        DuelOverlay_DrawSetBadge(
++            selectedFaceDown_
++        );
++    }
++
+     DuelOverlay_DrawTerrainBadge(
+         DuelEngine_GetTerrain()
+     );
+-
+     if (equipSelectionActive_) {
+         DuelOverlay_DrawEquipPanel(
+             equipCardId(),
+@@ -2358,7 +2721,8 @@
+         if (bannerIsMessage_) {
+             DuelOverlay_DrawMessageBanner(
+                 bannerCardId_,
+-                bannerMessage_
++                bannerMessage_,
++                bannerGood_
+             );
+         } else {
+             DuelOverlay_DrawSpellBanner(
+diff -u -r -N source.l9base/duel/DuelOverlays.cpp source/duel/DuelOverlays.cpp
+--- source.l9base/duel/DuelOverlays.cpp	2026-10-25 05:18:51.593486321 +0000
++++ source/duel/DuelOverlays.cpp	2026-10-26 03:33:34.312224997 +0000
+@@ -211,26 +211,44 @@
+     PixelText_Draw(x + 4, y + 17, message, PixelText_Color(31, 31, 31));
+ }
+ 
+-void DuelOverlay_DrawMessageBanner(int cardId, const char* message) {
++void DuelOverlay_DrawSetBadge(bool faceDown) {
++    constexpr int x = 152;
++    constexpr int y = 48;
++
++    PixelText_Fill(x, y, 100, 13, PixelText_Color(2, 3, 8));
++    PixelText_Frame(x, y, 100, 13, PixelText_Color(28, 22, 6));
++
++    const char* text = faceDown ? "R: FACE DOWN" : "R: FACE UP";
++
++    PixelText_Draw(
++        x + (100 - PixelText_Width(text, 1)) / 2, y + 4, text,
++        faceDown ? PixelText_Color(31, 14, 10) : PixelText_Color(18, 31, 20), 1
++    );
++}
++
++void DuelOverlay_DrawMessageBanner(int cardId, const char* message, bool good) {
++    /* sem carta (ataque, regra do turno): o titulo e BATTLE */
+     const CardData* card = GameData_GetCardById(cardId);
+ 
+-    if (card == nullptr || message == nullptr) {
++    if (message == nullptr) {
+         return;
+     }
+-
+     constexpr int x = 40;
+     constexpr int y = 80;
+     constexpr int width = 176;
+     constexpr int height = 32;
+ 
+     PixelText_Fill(x, y, width, height, PixelText_Color(2, 3, 8));
+-    PixelText_Frame(x, y, width, height, PixelText_Color(31, 10, 8));
++    PixelText_Frame(x, y, width, height, good ? PixelText_Color(8, 24, 12) : PixelText_Color(31, 10, 8));
+ 
+     char name[24];
+ 
+-    copyName(name, sizeof(name), card->name, 21);
++    copyName(name, sizeof(name), card != nullptr ? card->name : "BATTLE", 21);
+     PixelText_Draw(x + 4, y + 4, name, PixelText_Color(18, 31, 20));
+-    PixelText_Draw(x + 4, y + 17, message, PixelText_Color(31, 14, 10));
++    PixelText_Draw(
++        x + 4, y + 17, message,
++        good ? PixelText_Color(18, 31, 20) : PixelText_Color(31, 14, 10)
++    );
+ }
+ 
+ void DuelOverlay_DrawSwordsBadges() {
+@@ -249,11 +267,16 @@
+         );
+     }
+ 
+-    /* jogador sob Swords: nao pode atacar neste turno */
++    /* jogador sem poder atacar neste turno: primeiro turno ou Swords */
++    const int block = DuelEngine_GetAttackBlock(false);
+     const int you = DuelEngine_GetSwordsTurns(false);
+ 
+-    if (you > 0) {
+-        std::snprintf(text, sizeof(text), "NO ATK %d", you);
++    if (block != DUEL_ATTACK_BLOCK_NONE) {
++        if (block == DUEL_ATTACK_BLOCK_FIRST_TURN) {
++            std::snprintf(text, sizeof(text), "1ST TURN");
++        } else {
++            std::snprintf(text, sizeof(text), "NO ATK %d", you);
++        }
+         PixelText_Fill(96, 172, 56, kBadgeHeight, PixelText_Color(8, 2, 2));
+         PixelText_Frame(96, 172, 56, kBadgeHeight, PixelText_Color(31, 10, 8));
+         PixelText_Draw(
+@@ -464,7 +487,7 @@
+     /* Y alterna entre o deck basico (cartas 1-40 embaralhadas) e o de teste (todos os tipos, ordem fixa) */
+     PixelText_Draw(
+         8, 17,
+-        deckKind == 1 ? "Y: DECK TEST" : "Y: DECK BASIC",
++        deckKind == 2 ? "Y: DECK TRAPS" : (deckKind == 1 ? "Y: DECK TEST" : "Y: DECK BASIC"),
+         PixelText_Color(18, 31, 20), 1
+     );
+     char line[40];

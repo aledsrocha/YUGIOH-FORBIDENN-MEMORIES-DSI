@@ -1,0 +1,260 @@
+diff -u -r -N include.l4/DuelEngine.h include/DuelEngine.h
+--- include.l4/DuelEngine.h	2026-10-23 18:22:46.720618158 +0000
++++ include/DuelEngine.h	2026-10-23 18:22:46.741965421 +0000
+@@ -18,6 +18,13 @@
+ #define DUEL_TERRAIN_BONUS 500
+ #define DUEL_TERRAIN_COUNT 6
+ 
++/* Equips: +500 em ATK e DEF; Megamorph (carta 657, efeito 0x291) da +1000 */
++#define DUEL_MEGAMORPH_CARD_ID 657
++#define DUEL_MEGAMORPH_BONUS 1000
++
++/* Cartas de terreno: ids 330..335 = Forest, Wasteland, Mountain, Sogen, Umi, Yami */
++#define DUEL_FIRST_TERRAIN_CARD_ID 330
++
+ enum DuelTurn {
+     DUEL_TURN_PLAYER = 0,
+     DUEL_TURN_OPPONENT = 1
+@@ -179,6 +186,47 @@
+ void DuelEngine_SetTerrain(int terrain);
+ int DuelEngine_GetTerrain();
+ 
++/* Bonus (ATK e DEF) que a carta de equip da ao monstro. */
++int DuelEngine_GetEquipBonus(int equipCardId);
++
++/*
++    Cadeia de fusao da mao (regras de Fusion_Step do jogo): as cartas dos slots sao
++    combinadas da esquerda para a direita. A cada passo: se ha fusao, nasce o novo
++    monstro (sem os bonus anteriores); senao, um equip compativel se aplica ao
++    monstro; senao a fusao falha e fica a carta nova (ou o monstro, se a nova for
++    magia/armadilha). Todas as cartas escolhidas saem da mao. O resultado precisa
++    ser um monstro e vai para o slot de campo vazio informado.
++    handSlots: slots REAIS da mao do motor (1 a 5, sem repeticao).
++*/
++bool DuelEngine_FuseChainFromHand(
++    const int* handSlots,
++    int count,
++    int fieldIndex,
++    DuelPosition position
++);
++
++/* Joga uma carta de terreno da mao: define o terreno e a consome. */
++bool DuelEngine_PlayFieldMagicFromHand(int handIndex);
++
++/* Grupos de efeito de magia (tabela do jogo original; cartas 301-350, 651-700, 721). */
++enum DuelEffectGroup {
++    DUEL_EFFECT_GROUP_NONE = 0,
++    DUEL_EFFECT_GROUP_TERRAIN,
++    DUEL_EFFECT_GROUP_LIFE_POINT_RECOVERY,
++    DUEL_EFFECT_GROUP_DIRECT_DAMAGE,
++    DUEL_EFFECT_GROUP_BOARD_DESTRUCTION,
++    DUEL_EFFECT_GROUP_MONSTER_REMOVAL,
++    DUEL_EFFECT_GROUP_STOP_DEFENSE,
++    DUEL_EFFECT_GROUP_RAIGEKI,
++    DUEL_EFFECT_GROUP_DARK_PIERCING_LIGHT,
++    DUEL_EFFECT_GROUP_STAT_PENALTY,
++    DUEL_EFFECT_GROUP_SWORDS,
++    DUEL_EFFECT_GROUP_CURSEBREAKER,
++    DUEL_EFFECT_GROUP_RITUAL,
++    DUEL_EFFECT_GROUP_HARPIES_FEATHER_DUSTER
++};
++int DuelEngine_GetCardEffectGroup(int cardId);
++
+ /* Nome em maiusculas ("MARS".."VENUS"); "" se a estrela for invalida. */
+ const char* DuelEngine_GuardianStarName(int star);
+ 
+diff -u -r -N source.l4/DuelEngine.cpp source/DuelEngine.cpp
+--- source.l4/DuelEngine.cpp	2026-10-23 18:22:46.716871327 +0000
++++ source/DuelEngine.cpp	2026-10-23 18:23:17.097008511 +0000
+@@ -763,8 +763,8 @@
+         return false;
+     }
+ 
+-    monster->attackBonus += DUEL_EQUIP_BONUS;
+-    monster->defenseBonus += DUEL_EQUIP_BONUS;
++    monster->attackBonus += DuelEngine_GetEquipBonus(equipCardId);
++    monster->defenseBonus += DuelEngine_GetEquipBonus(equipCardId);
+ 
+     duel.player.hand.cards[equipHandIndex] = 0;
+ 
+@@ -1170,3 +1170,180 @@
+         *losses = lossCount;
+     }
+ }
++
++
++int DuelEngine_GetEquipBonus(int equipCardId) {
++    return equipCardId == DUEL_MEGAMORPH_CARD_ID
++        ? DUEL_MEGAMORPH_BONUS
++        : DUEL_EQUIP_BONUS;
++}
++
++namespace {
++
++struct ChainCard {
++    int id;
++    int attackBonus;
++    int defenseBonus;
++};
++
++/* Fusion_Step do jogo. Devolve true quando houve fusao ou equip. */
++bool ChainStep(const ChainCard& a, const ChainCard& b, ChainCard* out) {
++    const int fused = FusionEngine_GetResult(a.id, b.id);
++
++    if (fused > 0 && GameData_GetCardById(fused) != nullptr) {
++        /* monstro novo: perde os bonus de equip anteriores */
++        out->id = fused;
++        out->attackBonus = 0;
++        out->defenseBonus = 0;
++        return true;
++    }
++
++    if (EquipEngine_CanEquip(b.id, a.id)) {
++        *out = a;
++        out->attackBonus += DuelEngine_GetEquipBonus(b.id);
++        out->defenseBonus += DuelEngine_GetEquipBonus(b.id);
++        return true;
++    }
++
++    if (EquipEngine_CanEquip(a.id, b.id)) {
++        *out = b;
++        out->attackBonus += DuelEngine_GetEquipBonus(a.id);
++        out->defenseBonus += DuelEngine_GetEquipBonus(a.id);
++        return true;
++    }
++
++    /* falhou: a colocacao descarta a carta nova se for magia e houver monstro */
++    const CardData* first = GameData_GetCardById(a.id);
++    const CardData* second = GameData_GetCardById(b.id);
++
++    const bool keepFirst =
++        first != nullptr &&
++        second != nullptr &&
++        first->type < DUEL_FIRST_NON_MONSTER_TYPE &&
++        second->type >= DUEL_FIRST_NON_MONSTER_TYPE;
++
++    *out = keepFirst ? a : b;
++    return false;
++}
++
++}
++
++bool DuelEngine_FuseChainFromHand(
++    const int* handSlots,
++    int count,
++    int fieldIndex,
++    DuelPosition position
++) {
++    if (
++        handSlots == nullptr ||
++        duel.finished ||
++        duel.turn != DUEL_TURN_PLAYER ||
++        count < 1 ||
++        count > DUEL_HAND_SIZE ||
++        fieldIndex < 0 ||
++        fieldIndex >= DUEL_FIELD_SIZE ||
++        duel.player.field[fieldIndex].cardId != 0
++    ) {
++        return false;
++    }
++
++    unsigned used = 0;
++
++    for (int i = 0; i < count; i++) {
++        const int slot = handSlots[i];
++
++        if (
++            slot < 0 ||
++            slot >= DUEL_HAND_SIZE ||
++            (used & (1u << slot)) != 0 ||
++            duel.player.hand.cards[slot] == 0 ||
++            GameData_GetCardById(duel.player.hand.cards[slot]) == nullptr
++        ) {
++            return false;
++        }
++
++        used |= 1u << slot;
++    }
++
++    ChainCard current = {duel.player.hand.cards[handSlots[0]], 0, 0};
++
++    for (int i = 1; i < count; i++) {
++        const ChainCard next = {duel.player.hand.cards[handSlots[i]], 0, 0};
++        ChainCard out = current;
++
++        ChainStep(current, next, &out);
++        current = out;
++    }
++
++    const CardData* result = GameData_GetCardById(current.id);
++
++    if (result == nullptr || result->type >= DUEL_FIRST_NON_MONSTER_TYPE) {
++        return false;
++    }
++
++    DuelFieldCard* field = &duel.player.field[fieldIndex];
++
++    field->cardId = static_cast<uint16_t>(current.id);
++    field->position = position;
++    field->faceUp = true;
++    field->hasAttacked = false;
++    field->attackBonus = current.attackBonus;
++    field->defenseBonus = current.defenseBonus;
++    field->guardianStar = PickGuardianStar(result, 0);
++
++    for (int i = 0; i < count; i++) {
++        duel.player.hand.cards[handSlots[i]] = 0;
++    }
++
++    return true;
++}
++
++bool DuelEngine_PlayFieldMagicFromHand(int handIndex) {
++    if (
++        duel.finished ||
++        duel.turn != DUEL_TURN_PLAYER ||
++        handIndex < 0 ||
++        handIndex >= DUEL_HAND_SIZE
++    ) {
++        return false;
++    }
++
++    const int cardId = duel.player.hand.cards[handIndex];
++    const int terrain = cardId - DUEL_FIRST_TERRAIN_CARD_ID + 1;
++
++    if (cardId == 0 || terrain < 1 || terrain > DUEL_TERRAIN_COUNT) {
++        return false;
++    }
++
++    DuelEngine_SetTerrain(terrain);
++    duel.player.hand.cards[handIndex] = 0;
++
++    return true;
++}
++
++int DuelEngine_GetCardEffectGroup(int cardId) {
++    /* gDuelEffect_abGroupByEffectId do jogo original (104 entradas) */
++    static const uint8_t kGroupByEffectIndex[104] = {
++     0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
++     0,  0,  0,  6,  0,  0,  0,  0,  0,  0,  0,  0,  4,  1,  1,  1,
++     1,  1,  1,  4,  7,  2,  2,  2,  2,  2,  3,  3,  3,  3,  3, 10,
++     9,  8,  0,  0,  5,  0, 11,  5,  0,  0,  0,  5,  5,  5,  5,  5,
++    12, 12, 12,  0,  9, 12, 12, 13, 12, 12, 12, 12, 12, 12, 12, 12,
++     0,  0,  0,  0,  0,  0,  0,  0,  0,  0, 12, 12, 12, 12, 12, 12,
++    12, 12, 12, 12, 12,  0,  0,  0
++    };
++
++    int index;
++
++    if (cardId >= 301 && cardId < 351) {
++        index = cardId - 301;
++    } else if (cardId >= 651 && cardId < 701) {
++        index = cardId - 601;
++    } else if (cardId == 721) {
++        index = 100; /* Dark Magic Ritual */
++    } else {
++        return DUEL_EFFECT_GROUP_NONE;
++    }
++
++    return kGroupByEffectIndex[index];
++}

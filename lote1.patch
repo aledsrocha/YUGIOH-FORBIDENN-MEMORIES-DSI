@@ -1,0 +1,345 @@
+diff -u -r include.orig/DuelEngine.h include/DuelEngine.h
+--- include.orig/DuelEngine.h	2026-10-21 19:58:36.232441672 +0000
++++ include/DuelEngine.h	2026-10-21 19:58:36.256362787 +0000
+@@ -9,6 +9,7 @@
+ #define DUEL_FIELD_SIZE 5
+ #define DUEL_START_LP 8000
+ #define DUEL_EQUIP_BONUS 500
++#define DUEL_GUARDIAN_STAR_BONUS 500
+ 
+ enum DuelTurn {
+     DUEL_TURN_PLAYER = 0,
+@@ -44,6 +45,7 @@
+     bool hasAttacked;
+     int attackBonus;
+     int defenseBonus;
++    uint8_t guardianStar; /* 0 = nenhuma; 1..10 = estrela escolhida na invocacao */
+ };
+ 
+ struct DuelPlayerState {
+@@ -140,4 +142,29 @@
+ int DuelEngine_GetPlayerDeckRemaining();
+ int DuelEngine_GetOpponentDeckRemaining();
+ 
++/*
++    Estrelas guardias (numeracao dos .dat):
++    1 Marte, 2 Jupiter, 3 Saturno, 4 Urano, 5 Plutao, 6 Netuno,
++    7 Mercurio, 8 Sol, 9 Lua, 10 Venus.
++
++    Ciclos: Marte>Jupiter>Saturno>Urano>Plutao>Netuno>Marte
++            Mercurio>Sol>Lua>Venus>Mercurio
++    Quem tem a estrela mais forte contra a do oponente ganha
++    +DUEL_GUARDIAN_STAR_BONUS de ATK e DEF naquela batalha.
++*/
++bool DuelEngine_GuardianStarBeats(int star, int otherStar);
++
++/*
++    Define a estrela do monstro do jogador no slot.
++    choice: 0 = primeira estrela da carta, 1 = segunda.
++    O oponente (CPU) sempre usa a primeira.
++*/
++bool DuelEngine_SetGuardianStar(int fieldIndex, int choice);
++
++#ifdef YGOFM_TESTING
++/* Ganchos usados apenas pelos testes de PC (nao compilados no DS). */
++DuelState* DuelEngine_TestGetMutableState();
++bool DuelEngine_TestBuildDeck(DuelDeck* deck, const DuelistData* duelist);
++#endif
++
+ #endif
+diff -u -r include.orig/GameData.h include/GameData.h
+--- include.orig/GameData.h	2026-10-21 19:58:36.232657043 +0000
++++ include/GameData.h	2026-10-21 19:58:36.254809293 +0000
+@@ -3,6 +3,12 @@
+ 
+ #include <stdint.h>
+ 
++/* Raiz dos arquivos .dat. No DS fica nitro:/data/. Nos testes de PC e
++   redefinida com -DGAMEDATA_ROOT=\"data/bin/\". */
++#ifndef GAMEDATA_ROOT
++#define GAMEDATA_ROOT "nitro:/data/"
++#endif
++
+ struct __attribute__((packed)) DatHeader {
+     char magic[8];
+     uint32_t version;
+diff -u -r source.orig/DuelEngine.cpp source/DuelEngine.cpp
+--- source.orig/DuelEngine.cpp	2026-10-21 19:58:36.229304708 +0000
++++ source/DuelEngine.cpp	2026-10-21 19:58:36.257698323 +0000
+@@ -16,6 +16,7 @@
+     card->hasAttacked = false;
+     card->attackBonus = 0;
+     card->defenseBonus = 0;
++    card->guardianStar = 0;
+ }
+ 
+ static void ClearPlayerState(DuelPlayerState* state) {
+@@ -25,6 +26,26 @@
+     state->lifePoints = DUEL_START_LP;
+ }
+ 
++/*
++    Estrela escolhida ao invocar: choice 0 = primeira, 1 = segunda
++    (se a carta nao tiver segunda estrela, usa a primeira).
++*/
++static uint8_t PickGuardianStar(const CardData* card, int choice) {
++    if (!card) return 0;
++
++    if (choice == 1 && card->guardian2 != 0) {
++        return card->guardian2;
++    }
++
++    return card->guardian1;
++}
++
++/*
++    O campo duelist->deck NAO e quantidade de copias: sao pesos de
++    probabilidade (soma 2048 em todos os duelistas). Cada uma das 40
++    cartas do deck e sorteada de forma independente com esses pesos.
++    [a confirmar no executavel: limite de copias por carta]
++*/
+ static bool BuildDeck(
+     DuelDeck* deck,
+     const DuelistData* duelist
+@@ -34,20 +55,26 @@
+     deck->count = 0;
+     deck->drawIndex = 0;
+ 
+-    for (
+-        int cardIndex = 0;
+-        cardIndex < 722 && deck->count < DUEL_DECK_SIZE;
+-        cardIndex++
+-    ) {
+-        int amount = duelist->deck[cardIndex];
+-
+-        for (
+-            int copy = 0;
+-            copy < amount && deck->count < DUEL_DECK_SIZE;
+-            copy++
+-        ) {
+-            deck->cards[deck->count] = cardIndex + 1;
+-            deck->count++;
++    uint32_t total = 0;
++
++    for (int cardIndex = 0; cardIndex < 722; cardIndex++) {
++        total += duelist->deck[cardIndex];
++    }
++
++    if (total == 0) return false;
++
++    for (int slot = 0; slot < DUEL_DECK_SIZE; slot++) {
++        uint32_t roll = (uint32_t)rand() % total;
++        uint32_t accumulated = 0;
++
++        for (int cardIndex = 0; cardIndex < 722; cardIndex++) {
++            accumulated += duelist->deck[cardIndex];
++
++            if (roll < accumulated) {
++                deck->cards[deck->count] = cardIndex + 1;
++                deck->count++;
++                break;
++            }
+         }
+     }
+ 
+@@ -222,9 +249,26 @@
+ 
+     attacker->hasAttacked = true;
+ 
++    /*
++        Estrela guardia: so um lado pode ganhar o bonus (a relacao e
++        antissimetrica). [a confirmar: se vale com defensor virado]
++    */
++    int defenderStarBonus = 0;
++
++    if (DuelEngine_GuardianStarBeats(
++            attacker->guardianStar,
++            defender->guardianStar)) {
++        attackerPower += DUEL_GUARDIAN_STAR_BONUS;
++    } else if (DuelEngine_GuardianStarBeats(
++            defender->guardianStar,
++            attacker->guardianStar)) {
++        defenderStarBonus = DUEL_GUARDIAN_STAR_BONUS;
++    }
++
+     if (defender->position == DUEL_POSITION_ATTACK) {
+         int defenderPower =
+-            GetFieldPower(defenderOwner, targetIndex, true);
++            GetFieldPower(defenderOwner, targetIndex, true) +
++            defenderStarBonus;
+ 
+         int difference = attackerPower - defenderPower;
+ 
+@@ -240,7 +284,8 @@
+         }
+     } else {
+         int defenderPower =
+-            GetFieldPower(defenderOwner, targetIndex, false);
++            GetFieldPower(defenderOwner, targetIndex, false) +
++            defenderStarBonus;
+ 
+         int difference = attackerPower - defenderPower;
+ 
+@@ -327,6 +372,7 @@
+     field->hasAttacked = false;
+     field->attackBonus = 0;
+     field->defenseBonus = 0;
++    field->guardianStar = PickGuardianStar(card, 0);
+ 
+     if (card && card->defense > card->attack) {
+         field->position = DUEL_POSITION_DEFENSE;
+@@ -500,6 +546,8 @@
+     fieldCard->hasAttacked = false;
+     fieldCard->attackBonus = 0;
+     fieldCard->defenseBonus = 0;
++    fieldCard->guardianStar =
++        PickGuardianStar(GameData_GetCardById(cardId), 0);
+ 
+     return true;
+ }
+@@ -560,6 +608,8 @@
+     field->hasAttacked = false;
+     field->attackBonus = 0;
+     field->defenseBonus = 0;
++    field->guardianStar =
++        PickGuardianStar(GameData_GetCardById(field->cardId), 0);
+ 
+     duel.player.hand.cards[handIndex] = 0;
+ 
+@@ -618,6 +668,8 @@
+     field->hasAttacked = false;
+     field->attackBonus = 0;
+     field->defenseBonus = 0;
++    field->guardianStar =
++        PickGuardianStar(GameData_GetCardById(result), 0);
+ 
+     duel.player.hand.cards[firstHandIndex] = 0;
+     duel.player.hand.cards[secondHandIndex] = 0;
+@@ -843,3 +895,58 @@
+     return duel.opponent.deck.count -
+            duel.opponent.deck.drawIndex;
+ }
++
++
++bool DuelEngine_GuardianStarBeats(int star, int otherStar) {
++    if (star < 1 || star > 10 || otherStar < 1 || otherStar > 10) {
++        return false;
++    }
++
++    /* grupo 1: Marte..Netuno (1..6) | grupo 2: Mercurio..Venus (7..10) */
++    bool firstGroup = star <= 6;
++
++    if (firstGroup != (otherStar <= 6)) {
++        return false;
++    }
++
++    int next;
++
++    if (firstGroup) {
++        next = (star == 6) ? 1 : star + 1;
++    } else {
++        next = (star == 10) ? 7 : star + 1;
++    }
++
++    return otherStar == next;
++}
++
++bool DuelEngine_SetGuardianStar(int fieldIndex, int choice) {
++    if (
++        duel.finished ||
++        fieldIndex < 0 ||
++        fieldIndex >= DUEL_FIELD_SIZE
++    ) {
++        return false;
++    }
++
++    DuelFieldCard* fieldCard = &duel.player.field[fieldIndex];
++
++    if (fieldCard->cardId == 0) {
++        return false;
++    }
++
++    fieldCard->guardianStar =
++        PickGuardianStar(GameData_GetCardById(fieldCard->cardId), choice);
++
++    return true;
++}
++
++#ifdef YGOFM_TESTING
++DuelState* DuelEngine_TestGetMutableState() {
++    return &duel;
++}
++
++bool DuelEngine_TestBuildDeck(DuelDeck* deck, const DuelistData* duelist) {
++    return BuildDeck(deck, duelist);
++}
++#endif
+diff -u -r source.orig/EquipEngine.cpp source/EquipEngine.cpp
+--- source.orig/EquipEngine.cpp	2026-10-21 19:58:36.229327570 +0000
++++ source/EquipEngine.cpp	2026-10-21 19:58:36.255723480 +0000
+@@ -1,4 +1,5 @@
+ #include "EquipEngine.h"
++#include "GameData.h" /* GAMEDATA_ROOT */
+ 
+ #include <stdio.h>
+ #include <string.h>
+@@ -18,7 +19,7 @@
+ static int equipCount = 0;
+ 
+ bool EquipEngine_Load() {
+-    FILE* fp = fopen("nitro:/data/equips.dat", "rb");
++    FILE* fp = fopen(GAMEDATA_ROOT "equips.dat", "rb");
+ 
+     if (!fp) {
+         return false;
+diff -u -r source.orig/GameData.cpp source/GameData.cpp
+--- source.orig/GameData.cpp	2026-10-21 19:58:36.229353707 +0000
++++ source/GameData.cpp	2026-10-21 19:58:36.255448623 +0000
+@@ -18,7 +18,7 @@
+ }
+ 
+ static bool LoadCards() {
+-    FILE* fp = fopen("nitro:/data/cards.dat", "rb");
++    FILE* fp = fopen(GAMEDATA_ROOT "cards.dat", "rb");
+     DatHeader h;
+ 
+     if (!ReadHeader(fp, "FMCARD", &h)) {
+@@ -35,7 +35,7 @@
+ }
+ 
+ static bool LoadFusions() {
+-    FILE* fp = fopen("nitro:/data/fusions.dat", "rb");
++    FILE* fp = fopen(GAMEDATA_ROOT "fusions.dat", "rb");
+     DatHeader h;
+ 
+     if (!ReadHeader(fp, "FMFUS", &h)) {
+@@ -52,7 +52,7 @@
+ }
+ 
+ static bool LoadDuelists() {
+-    FILE* fp = fopen("nitro:/data/duelists.dat", "rb");
++    FILE* fp = fopen(GAMEDATA_ROOT "duelists.dat", "rb");
+     DatHeader h;
+ 
+     if (!ReadHeader(fp, "FMDUEL", &h)) {
+@@ -69,7 +69,7 @@
+ }
+ 
+ static bool LoadEquipsCount() {
+-    FILE* fp = fopen("nitro:/data/equips.dat", "rb");
++    FILE* fp = fopen(GAMEDATA_ROOT "equips.dat", "rb");
+     DatHeader h;
+ 
+     if (!ReadHeader(fp, "FMEQIP", &h)) {
+@@ -97,6 +97,11 @@
+ }
+ 
+ const CardData* GameData_GetCardById(int id) {
++    /* ids sao sequenciais (1..N): acesso direto, com busca como reserva */
++    if (id >= 1 && id <= cardCount && cards[id - 1].id == id) {
++        return &cards[id - 1];
++    }
++
+     for (int i = 0; i < cardCount; i++) {
+         if (cards[i].id == id) return &cards[i];
+     }
